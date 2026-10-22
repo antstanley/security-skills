@@ -1,0 +1,21 @@
+{
+  "name": "security",
+  "version": "0.3.0",
+  "description": "Security workflows for coding agents — repository and diff scans, deep multi-pass scans, threat modelling, validation, attack-path analysis, triage, remediation, and reporting against a sealed scan contract.",
+  "author": {
+    "name": "antstanley"
+  },
+  "repository": "https://github.com/antstanley/security-skills",
+  "license": "Apache-2.0",
+  "keywords": ["security", "code-review", "diff-review", "appsec", "threat-modeling"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Security",
+    "shortDescription": "Security workflows",
+    "longDescription": "Security workflows — repository and diff scans, deep multi-pass scans, threat modelling, validation, attack-path analysis, triage, remediation, and reporting against a sealed scan contract.",
+    "developerName": "antstanley",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Review this repository for security issues."]
+  }
+}

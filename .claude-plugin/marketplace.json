@@ -1,0 +1,18 @@
+{
+  "name": "security-skills",
+  "owner": {
+    "name": "antstanley"
+  },
+  "metadata": {
+    "description": "Security skills for Claude Code, Codex, and other Agent Skills harnesses."
+  },
+  "plugins": [
+    {
+      "name": "security",
+      "source": "./",
+      "description": "Security workflows — repository and diff scans, deep multi-pass scans, threat modelling, validation, attack-path analysis, triage, remediation, and reporting against a sealed scan contract.",
+      "category": "development",
+      "homepage": "https://github.com/antstanley/security-skills"
+    }
+  ]
+}

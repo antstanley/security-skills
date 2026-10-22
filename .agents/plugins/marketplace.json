@@ -1,0 +1,20 @@
+{
+  "name": "security-skills",
+  "interface": {
+    "displayName": "Security Skills"
+  },
+  "plugins": [
+    {
+      "name": "security",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

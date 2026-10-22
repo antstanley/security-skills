@@ -1,0 +1,12 @@
+# The scripts here are vendored from openai/codex-security, which formats at 100
+# columns. Inherit every repo lint rule and override only the line length, so the
+# vendored files stay byte-comparable against upstream when pulling fixes.
+extend = "../../pyproject.toml"
+line-length = 100
+
+[lint.per-file-ignores]
+# The remaining long lines are report-template and error string literals. The
+# formatter cannot split string literals, and rewrapping them would change text
+# that validate_report_format.py asserts on. Code width is still enforced by
+# `ruff format` at 100 columns.
+"scripts/*.py" = ["E501"]

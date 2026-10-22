@@ -1,0 +1,43 @@
+{
+  "documentType": "security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "c31c46d563504795b01bec0aaad59a4498d42c651ba9fafcf689587cc54df018"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "0f32b0b50964b722cfd6fb440fca6f20ad2f212b44bcf005c453251ff104506a"
+      }
+    ],
+    "completedAt": "2026-05-31T18:09:00Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "scan_example_001",
+    "producer": {
+      "name": "security-skills",
+      "version": "0.1.0"
+    },
+    "scope": {
+      "excludePaths": [],
+      "includePaths": [
+        "src/"
+      ]
+    },
+    "sealedAt": "2026-05-31T18:09:00Z",
+    "startedAt": "2026-05-31T18:00:00Z",
+    "status": "completed",
+    "target": {
+      "displayName": "example/repo",
+      "kind": "git_worktree",
+      "remote": "https://github.com/example/repo",
+      "revision": "deadbeef",
+      "snapshotDigest": "security-snapshot/v1:sha256:ed88f96a4c1a06603a41b3f261f59c3de2555c367ef6ad3bb8b9e483495d34eb",
+      "targetId": "target_sha256_example"
+    }
+  },
+  "schemaVersion": "1.0"
+}
