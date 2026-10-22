@@ -17,7 +17,9 @@ A useful `SECURITY.md` tells Security what matters in a repository: the system b
 
 ## 1. Find the Applicable Policies
 
-Confirm the repository or component the user wants to cover. Inventory policy paths, including hidden directories, before reading them:
+Confirm the repository or component the user wants to cover. Inventory policy paths, including hidden directories, before reading them.
+
+Resolve `<python_command>` to the configured Python interpreter (`$PYTHON` when one is provided), otherwise use `python` on Windows and `python3` on Unix-like hosts:
 
 ```bash
 <python_command> <skill_root>/scripts/resolve_security_md.py --repo <repo_root> --list
@@ -31,7 +33,7 @@ Read `references/security-guidance.md`, then resolve the policy chain for the fi
 <python_command> <skill_root>/scripts/resolve_security_md.py --repo <repo_root> --scope <file_or_directory> --out -
 ```
 
-`<skill_root>` is the directory that bundles this skill's `scripts/`, `references/`, and `schemas/`, not the target repository.
+`<skill_root>` is the directory that contains this skill's `SKILL.md` and the `scripts/` and `references/` it bundles, not the target repository.
 
 Root and nested policies compose from root to leaf; the policy closest to the code takes precedence when guidance conflicts. When reviewing a whole repository, inventory nested policies so component-specific boundaries are not missed. Do not treat `.github/SECURITY.md` or `docs/SECURITY.md` as repository-wide scanner guidance or overwrite them while creating a root policy.
 

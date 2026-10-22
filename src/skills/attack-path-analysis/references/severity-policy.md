@@ -141,13 +141,13 @@ Severity calibration and final policy-adjustment matrix:
   - `likelihood=ignore` -> `ignore`
   - `likelihood=unknown` -> `low`
 
-Priority mapping after final severity:
+Narrative priority labels (prose only):
 
 - `critical` -> `P0`
 - `high` -> `P1`
 - `medium` -> `P2`
 - `low` -> `P3`
 
-Use this mapping after the final policy-adjustment pass determines the final reportable severity. Do not assign a priority to findings whose final policy decision is `ignore`.
+Priority is a fixed restatement of final severity for readers who triage by priority. It is not an artifact field: the nested `attack_path` record, `findings.json`, `coverage.json`, and the generated report carry severity only, and severity alone orders findings. Do not add a priority key to any record. When a priority label helps a reader, derive it from the final reportable severity with this mapping and mention it in prose only, such as the finding's `remediation` text or a follow-up note to the user. Do not give a priority to findings whose final policy decision is `ignore`.
 
 Once the facts are set, use the severity calibration and final policy-adjustment matrix mechanically. Do not re-argue severity from scratch afterward.

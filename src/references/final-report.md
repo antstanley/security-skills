@@ -16,7 +16,7 @@ Use `report.md` as the primary readable entry point. Explain report-relevant art
 
 In the final response, link the generated markdown report path as the primary readable artifact.
 
-Every scan mode uses the same final report pipeline. The model authors canonical JSON only; it must not author, repair, or treat an existing `report.md` as input. Author `scan-manifest.json` as an unsealed draft and omit `scan.sealedAt` and `scan.artifacts`; finalization owns the exact timestamps, seal, artifact digests, and derived finding identities. Finalization validates and enriches the canonical JSON, seals the canonical JSON and evidence artifacts, then deterministically generates and validates `report.md` as an unsealed downstream projection. Missing report prose must be added to the structured canonical fields rather than recovered from a separately authored report.
+Every scan mode uses the same final report pipeline. The model authors canonical JSON only; it must not author, repair, or treat an existing `report.md` as input. Author `scan-manifest.json` as an unsealed draft and omit `scan.sealedAt` and `scan.artifacts`; record `scan.startedAt`, and `scan.completedAt` when it is known, in the draft. Finalization owns the seal, artifact digests, and derived finding identities: it uses `SECURITY_STARTED_AT` only when the draft omits `startedAt`, stamps the current UTC time when the draft omits `completedAt`, always sets `sealedAt` to `completedAt`, and rejects a `startedAt` later than `completedAt`. Finalization validates and enriches the canonical JSON, seals the canonical JSON and evidence artifacts, then deterministically generates and validates `report.md` as an unsealed downstream projection. Missing report prose must be added to the structured canonical fields rather than recovered from a separately authored report.
 
 Complete the scan by running the finalizer after writing the completed canonical JSON:
 
@@ -35,7 +35,7 @@ If the finalizer fails, stop and surface its exact error. Do not retry finalizat
 Canonical report semantics live in these fields:
 
 - `scan-manifest.json`: `scan.scope` and `scan.threatModel`
-- `findings.json`: each finding's `summary`, `codeEvidence`, `rootCause`, `validation`, `attackPath.dataflow`, `attackPath.reachability`, `severity.rationale`, `severity.changeConditions`, `remediation`, `remediationTests`, and `preventiveControls`
+- `findings.json`: each finding's `summary`, `codeEvidence`, `rootCause`, `validation`, `attackPath.summary`, `attackPath.dataflow`, `attackPath.reachability`, `attackPath.impact`, `attackPath.likelihood`, `attackPath.limitations`, `severity.rationale`, `severity.changeConditions`, `remediation`, `remediationTests`, and `preventiveControls`
 - `findings.json`: optional `writeup.reportPath` for a derived, unsealed detailed vulnerability report written under `findings/<slug>/<slug>.md`
 - `scan-manifest.json`: optional `scan.hardening.portfolioPath` for the derived, unsealed design portfolio at `hardening/hardening.md`
 - `coverage.json`: `surfaces` including `riskArea` and `notes`, plus `openQuestions`
@@ -50,18 +50,46 @@ When there are no reportable findings, include a short `No findings` section tha
 
 When there are reportable findings, render them as readable markdown findings rather than raw JSON or a dumped schema object.
 Order findings from highest severity to lowest severity: `critical`, then `high`, then `medium`, then `low`.
+The documented pipeline does not produce `informational` findings, but the schema accepts them for older or imported bundles. The projection renders any `informational` finding in a separate `### Informational Findings` section after the reportable findings, with its own summary table and detailed sections numbered after the last reportable finding. It does not count them as reportable findings or include them in the severity and confidence mix; the scan summary reports them as a separate `Informational findings` count.
 
 Use a separate finding entry for each independently attackable source/control/sink instance. Do not combine sibling routes, templates, query builders, parser operations, auth/object-access endpoints, or shared-helper callers into one representative finding solely for readability; if grouping helps, add a short grouped summary after the individual finding entries.
 
-If validation or attack-path analysis provides a broad family row with multiple independently triggerable sink, parser, helper, API-mode, or protected-action lines, split it into child final findings before writing the report. Multiple affected lines inside one finding are appropriate for one inseparable proof tuple, such as a wrapper plus its shared sink, but not as a substitute for separate findings when sibling operations can be triggered independently.
+If validation or attack-path analysis provides a broad family row with multiple independently triggerable sink, parser, helper, API-mode, or protected-action lines, split it into child final findings before writing the report. Multiple affected lines inside one finding are appropriate for one inseparable proof tuple, such as a wrapper plus its shared sink, but not as a substitute for separate findings when sibling operations can be triggered independently. In compact-ledger scans, validation records these children in the row's `validation.children` array and attack-path analysis records them in matching `attack_path.children` entries, keyed by `child_id` (see `scan-artifacts.md`). When a row has `validation.children`, treat each child, not the parent row, as one candidate for the ordered row-outcome mapping below: combine the child's validation entry with the `attack_path.children` entry of the same `child_id`, and fall back to the parent records only for shared fields the child omits. Each child that becomes a finding is its own finding, with the child's locations (plus any shared entrypoint or wrapper lines in its proof tuple), its own confidence and severity, and `identity.instance` set to the child slug (the part of `child_id` after the parent `candidate_id`), so siblings that share a rule and anchor get distinct finding identities. Do not use the full `child_id` or `candidate_id` as the instance, because those embed line-dependent hashes. In deep-scan outputs, also set `extensions.candidateId` to the parent `candidate_id` and `extensions.reportId` to the `child_id` so the summary table groups the children. Ordinary standard scans leave these extensions unset, because the projection treats them as the deep-scan signal. Each child that does not become a finding gets the coverage treatment a whole row would get, using the `child_id` as the surface or `coverage.deferred` entry `id`. The parent row produces no separate finding or coverage outcome. A child without a validation disposition, or a `reportable` or `deferred` child without its attack-path entry, leaves the candidate unresolved and prevents complete coverage.
 
 Set the finding category and CWE from the primary broken control. Do not add secondary support-impact CWEs, such as data exposure or missing authentication, to an injection/RCE/path/file/parser finding merely because they make exploitation worse; mention those impacts in prose or emit a separate finding if that secondary control is independently vulnerable.
 
 Examples that should normally become separate final findings include SQL API modes such as `execute`, `executemany`, and `executescript`; deserializer variants such as `pickle.load`, `pickle.loads`, `yaml.load`, and `yaml.load_all`; distinct path/file helper calls; SSRF modes with different destination controls; and missing-auth protected actions such as create, delete, reset, admin, and job-trigger endpoints.
 
-For a standard repository or scoped-path scan — including the deep-scan centralized tail, which runs the same compact mode — assemble the canonical JSON from the enriched `<discovery_dir>/candidate_ledger.jsonl`. Map each nested `validation` record into the finding's validation fields, map its confidence and rationale into top-level `confidence.level` and `confidence.rationale`, and map each nested `attack_path` record into dataflow, reachability, severity, and change conditions.
+For a standard repository or scoped-path scan — including the deep-scan centralized tail, which runs the same compact mode — assemble the canonical JSON from the enriched `<discovery_dir>/candidate_ledger.jsonl`. Map each reportable row's fields as follows; `finding-detail-fields.md` describes the canonical fields:
 
-Apply row outcomes in this order: validation disposition `reportable` plus attack-path decision `reportable` becomes a finding with its distinct instance and all relevant entrypoint, root-control, sink, and supporting locations; otherwise, a `deferred` result from either phase becomes `needs_follow_up` coverage and a `coverage.deferred` entry using the recorded uncertainty or proof gap; otherwise, validation disposition `not_applicable` becomes `not_applicable` coverage; otherwise, validation disposition `suppressed` or attack-path decision `ignore` becomes `rejected` coverage. A missing required phase record leaves the candidate unresolved and prevents complete coverage. Do not require phase receipts, per-candidate narratives, or another reconciliation pass.
+| Ledger field | Canonical field |
+| --- | --- |
+| `cwe_ids` | `taxonomy.cwe` |
+| `locations` | `locations`, keeping every role |
+| `instance` | `identity.instance` |
+| `validation.method` | `validation.method` |
+| `validation.evidence` | `validation.summary`; copy the source it relies on into `codeEvidence` and list those ids in `validation.evidenceRefs` |
+| `validation.rubric` | `validation.assertions`, one entry per checked criterion |
+| `validation.counterevidence_or_proof_gap` | `validation.limitations` |
+| `validation.remaining_uncertainty` | `validation.limitations` |
+| `validation.confidence` | `confidence.level` |
+| `validation.confidence_rationale` | `confidence.rationale` |
+| `validation.source`, `validation.sink` | `attackPath.dataflow.source`, `attackPath.dataflow.sink` |
+| `validation.control` | `rootCause.summary`, as the missing or broken control |
+| `validation.preconditions` | `attackPath.reachability.preconditions` |
+| `validation.artifact_paths` | not projected; the paths stay in the ledger |
+| `attack_path.dataflow` | `attackPath.dataflow.summary` |
+| `attack_path.reachability` | `attackPath.reachability.summary` |
+| `attack_path.counterevidence` | `attackPath.limitations` |
+| `attack_path.impact`, `attack_path.likelihood` | `attackPath.impact.level`, `attackPath.likelihood.level`; add `why` only when the record explains the level |
+| `attack_path.severity` | `severity.level` |
+| `attack_path.severity_rationale` | `severity.rationale` |
+| `attack_path.change_conditions` | `severity.changeConditions` |
+| `attack_path.proof_gap` | for deferred rows, the `coverage.deferred` reason |
+
+Keep `validation.limitations` populated whenever validation recorded counterevidence, a proof gap, or remaining uncertainty; the projected Validation section lists them as remaining uncertainty.
+
+Apply row outcomes in this order: validation disposition `reportable` plus attack-path decision `reportable` becomes a finding with its distinct instance and all relevant entrypoint, root-control, sink, and supporting locations; otherwise, a `deferred` result from either phase becomes `needs_follow_up` coverage and a `coverage.deferred` entry using the recorded uncertainty or proof gap; otherwise, validation disposition `not_applicable` becomes `not_applicable` coverage; otherwise, validation disposition `suppressed` or attack-path decision `ignore` becomes `rejected` coverage. Confidence does not gate this mapping: a reportable row with `low` confidence still becomes a finding, and its confidence label and rationale tell the reader how much proof is missing. A missing required phase record leaves the candidate unresolved and prevents complete coverage. Do not require phase receipts, per-candidate narratives, or another reconciliation pass.
 
 Diff and resumed legacy scans provide per-candidate ledgers, validation closure tables, and repository coverage ledgers; deep scans do not create per-candidate receipts. When those artifacts exist, retain their traceability: start from reportable/surviving rows, preserve exact affected locations, and map suppressed, not-applicable, or deferred rows to public-facing coverage outcomes. Do not silently drop a seeded row because a same-family neighbor survived.
 
@@ -75,7 +103,7 @@ Use this report structure:
 
 Populate `scan.scope` with in-scope context, artifacts reviewed, runtime or test status, validation mode, and explicit limitations. Include/exclude paths and coverage fields supply the remaining projected scope content. If the threat model was generated during Phase 1 rather than provided by the user, say that in canonical scope context. Do not call generated threat-model material an external input.
 
-After the scope bullets, include a compact `### Scan Summary` table when the scan has findings or repository-wide coverage. Use columns `Field` and `Value`. Include the count of reportable findings, severity mix, confidence mix, coverage, and validation mode when those values are known. Keep artifact paths below this table.
+After the scope bullets, include a compact `### Scan Summary` table when the scan has findings or repository-wide coverage. Use columns `Field` and `Value`. Include the count of reportable findings, severity mix, confidence mix, coverage, and validation mode when those values are known, plus a separate `Informational findings` count when any exist. Keep artifact paths below this table.
 
 `## Threat Model`
 
@@ -91,7 +119,7 @@ After the summary table, include a compact `### Confidence Scale` table with col
 
 - `high`: direct source, configuration, or runtime evidence supports the finding, with no material unresolved reachability or exploitability blocker.
 - `medium`: source evidence supports a plausible issue, but runtime behavior, deployment configuration, role reachability, type constraints, or exploit reliability still need proof.
-- `low`: weak or incomplete evidence; include only when the user explicitly wants follow-up candidates in the final report.
+- `low`: weak or incomplete evidence; the finding is reported so it can be followed up explicitly. Low confidence does not remove a finding that passed the reportability gates.
 
 When a finding records `writeup.reportPath`, link the detailed report from the findings summary and do not duplicate the complete finding inline. The linked write-up is a derived, unsealed readable output; the canonical finding remains the source of truth for adapters and regeneration. Findings without a write-up continue to use the inline format below for compatibility.
 
@@ -101,7 +129,7 @@ Render each inline finding as:
 
 For each finding include a compact two-column metadata table immediately below the heading. Use columns `Field` and `Value`. Include these rows:
 
-- `Severity`: `critical|high|medium|low`
+- `Severity`: `critical|high|medium|low`, or `informational` in the separate informational section
 - `Confidence`: `high|medium|low` or a short calibrated confidence label
 - `Confidence rationale`: one sentence explaining why the confidence label is calibrated that way, grounded in the validation method, direct evidence, and missing proof if any
 - `Category`: concrete vulnerability class
@@ -127,16 +155,16 @@ Then render these subsections under each finding:
   - Show the smallest complete snippets needed for that walkthrough. Omit incidental helpers, but do not skip a call boundary whose behavior is necessary to understand how attacker input reaches the broken invariant.
   - Do not emit generic prose that only repeats an affected `path:line` already present in the metadata table.
 - `#### Validation`
-  - Include method, checklist items, evidence, and remaining uncertainty.
+  - Include method, checklist items, evidence, and remaining uncertainty. The projection renders `validation.summary`, `validation.method`, the code evidence in `validation.evidenceRefs`, `validation.assertions` as checks, and `validation.limitations` as remaining uncertainty. It always shows a remaining-uncertainty list and says so when none was recorded.
   - Pair each important validation claim with actual source in `validation.evidenceRefs`; a list of file names and line numbers is not sufficient evidence for the readable finding.
 - `#### Dataflow`
   - Show the technical source-to-sink path inside the code, such as request parameter -> controller -> service/helper -> dangerous sink -> response or side effect.
 - `#### Reachability`
-  - Explain who can realistically trigger the dataflow, from what boundary, under what preconditions, and what attacker outcome follows. Fold any attack-path facts into this prose or compact bullets instead of emitting a separate `Attack Path Facts` section.
+  - Explain who can realistically trigger the dataflow, from what boundary, under what preconditions, and what attacker outcome follows. Fold any attack-path facts into this prose or compact bullets instead of emitting a separate `Attack Path Facts` section. The projection opens this section with `attackPath.summary`, then `attackPath.reachability`, and lists `attackPath.limitations` last.
   - Use `attackPath.evidenceRefs` for the few code transitions that establish attacker input, the missing control, and the resulting sink or state change. Keep this shorter than Validation.
 - `#### Severity`
   - State the final severity and then explain the rationale.
-  - Treat likelihood and impact as inputs to the final severity, not as separate report labels.
+  - Treat likelihood and impact as inputs to the final severity, not as separate report labels. The projection shows the `why` of `attackPath.impact` and `attackPath.likelihood` as supporting rationale under the severity, without their levels.
   - The rationale should fold in reachability: attacker role, exposed entry point, exploit steps, required feature flags/config, runtime/deployment assumptions, and any counterevidence or blockers.
   - The rationale should explain the concrete security consequence using repository evidence: data exposed, integrity boundary broken, credential/control-plane effect, code execution path, or why impact is narrower.
   - Include one concise sentence explaining what specific additional evidence would raise or lower the severity.

@@ -145,4 +145,18 @@ The following shape shows how to encode the archive-extraction path-traversal fi
 }
 ```
 
+## How The Report Renders These Fields
+
+The generated report shows each documented field in a fixed place:
+
+- **Validation**: `validation.summary`, `validation.method`, the code evidence in `validation.evidenceRefs`, `validation.assertions` as a list of checks, and `validation.limitations` as counterevidence and remaining uncertainty. The remaining-uncertainty list is always shown; when nothing was recorded it says so.
+- **Dataflow**: `attackPath.dataflow` summary, source, sink, outcome, and transformations, followed by the code evidence in `attackPath.evidenceRefs`.
+- **Reachability**: `attackPath.summary`, then the `attackPath.reachability` summary, attacker, entry point, outcome, and preconditions, then `attackPath.limitations`.
+- **Severity**: `severity.rationale`, then the `why` of `attackPath.impact` and `attackPath.likelihood` as supporting rationale, then `severity.changeConditions`. The impact and likelihood levels are severity inputs and are not shown as separate labels.
+
+Two older validation fields remain supported for compatibility. New producers should use the documented fields above instead:
+
+- `validation.evidence`: a list of short evidence statements, or one string. The report lists them under `Evidence`.
+- `validation.counterEvidence`: a list of counterevidence statements, or one string. The report lists them with `validation.limitations` as remaining uncertainty.
+
 `rootCause.code` and `rootCause.language` remain supported for older producers that can provide only one snippet. New producers should use the shared `codeEvidence` catalog, assign call-stack roles, and order `rootCause.evidenceRefs` from input to outcome so the same exact source can support Root Cause, Validation, and Attack-path analysis without copying it into several fields.

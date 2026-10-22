@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Validate and combine security-scan candidates into deterministic JSONL."""
+"""Validate and combine security-scan candidates into deterministic JSONL.
+
+Rows describe the same candidate when they are compatible: a primary location
+(`root_control` or `sink`, or every location when a row has neither) shares a
+path and an overlapping line range, the CWE sets intersect or are both empty,
+and the rows do not carry different explicit `instance` labels. Rows are read
+in sorted input-path then line order; each joins the first earlier group whose
+every member it is compatible with, or starts a new group. Earlier groups are
+therefore never split or renumbered by later inputs, and a group's
+`candidate_id` comes from its first row.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +32,7 @@ ROLES = {
     "concrete_implementation": 5,
     "evidence": 6,
 }
+PRIMARY_ROLES = {"root_control", "sink"}
 FIELDS = {
     "candidate_id",
     "cwe_ids",
@@ -227,40 +238,151 @@ def identity(row: dict[str, Any]) -> str:
     )
 
 
+def primary_locations(row: dict[str, Any]) -> list[dict[str, Any]]:
+    primary = [item for item in row["locations"] if item["role"] in PRIMARY_ROLES]
+    return primary or row["locations"]
+
+
+def instance_label(row: dict[str, Any]) -> str | None:
+    instance = row.get("instance")
+    return " ".join(instance.split()).casefold() if isinstance(instance, str) else None
+
+
+def compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_instance, right_instance = instance_label(left), instance_label(right)
+    if left_instance and right_instance and left_instance != right_instance:
+        return False
+    left_cwes, right_cwes = set(left["cwe_ids"]), set(right["cwe_ids"])
+    if (left_cwes or right_cwes) and not left_cwes & right_cwes:
+        return False
+    return any(
+        first["path"] == second["path"]
+        and first["start_line"] <= second["end_line"]
+        and second["start_line"] <= first["end_line"]
+        for first in primary_locations(left)
+        for second in primary_locations(right)
+    )
+
+
 def merged_text(group: list[dict[str, Any]], field: str) -> str:
     return "\n".join(sorted({item[field] for item in group if field in item}))
 
 
-def combine(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        groups.setdefault(identity(row), []).append(row)
-    combined: list[dict[str, Any]] = []
-    for key, group in sorted(groups.items()):
-        candidate_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+def merged_locations(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = {
+        (item["path"], item["start_line"], item["end_line"], item["role"]): item
+        for row in group
+        for item in row["locations"]
+    }
+    return sorted(
+        unique.values(),
+        key=lambda item: (
+            ROLES[item["role"]],
+            item["path"],
+            item["start_line"],
+            item["end_line"],
+        ),
+    )
 
-        result = {
-            "candidate_id": f"candidate-{candidate_id}",
-            "cwe_ids": group[0]["cwe_ids"],
-            "locations": group[0]["locations"],
+
+def merged_cwe_ids(group: list[dict[str, Any]]) -> list[str]:
+    numbers = {int(cwe.removeprefix("CWE-")) for row in group for cwe in row["cwe_ids"]}
+    return [f"CWE-{number}" for number in sorted(numbers)]
+
+
+def combine(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group compatible rows; `rows` must already be in sorted source order."""
+
+    groups: list[list[dict[str, Any]]] = []
+    for row in rows:
+        for group in groups:
+            # Complete linkage: a row joins only when it matches every member,
+            # so one broad row cannot chain two distinct sibling bugs together.
+            if all(compatible(row, member) for member in group):
+                group.append(row)
+                break
+        else:
+            groups.append([row])
+
+    combined: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for group in groups:
+        candidate_id = f"candidate-{hashlib.sha256(identity(group[0]).encode()).hexdigest()[:16]}"
+        if candidate_id in seen_ids:
+            fallback = json.dumps([identity(row) for row in group], ensure_ascii=False)
+            candidate_id = f"candidate-{hashlib.sha256(fallback.encode()).hexdigest()[:16]}"
+        seen_ids.add(candidate_id)
+        result: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "cwe_ids": merged_cwe_ids(group),
+            "locations": merged_locations(group),
             "summary": merged_text(group, "summary"),
             "evidence": merged_text(group, "evidence"),
+            "sources": [row["_source"] for row in group],
         }
         context = merged_text(group, "context")
         if context:
             result["context"] = context
-        if "instance" in group[0]:
-            result["instance"] = group[0]["instance"]
+        instance = next((row["instance"] for row in group if "instance" in row), None)
+        if instance is not None:
+            result["instance"] = instance
         combined.append(result)
+    combined.sort(
+        key=lambda row: (
+            primary_locations(row)[0]["path"],
+            primary_locations(row)[0]["start_line"],
+            row["candidate_id"],
+        )
+    )
     return combined
 
 
+def source_label(source: Path, output: Path) -> str:
+    try:
+        return source.relative_to(output.parent).as_posix()
+    except ValueError:
+        return source.as_posix()
+
+
+def write_jsonl_atomically(output: Path, rows: list[dict[str, Any]]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+        for row in rows
+    )
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+        temporary.replace(output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--input", nargs="+", required=True, help="Candidate JSONL inputs.")
     parser.add_argument("--out", required=True, help="Combined candidate JSONL output.")
     parser.add_argument("--repo-root", required=True, help="Repository root for candidate paths.")
     parser.add_argument("--in-scope-files", required=True, help="Repository-relative file list.")
+    parser.add_argument(
+        "--rejects",
+        help=(
+            "Skip invalid rows instead of failing: write each rejected row's input, line, "
+            "and reason to this JSONL path and still write the valid rows to --out."
+        ),
+    )
     args = parser.parse_args()
     try:
         repo_root = Path(args.repo_root).expanduser().resolve(strict=True)
@@ -269,48 +391,45 @@ def main() -> None:
         output = Path(args.out).expanduser().resolve(strict=False)
         scope_path = Path(args.in_scope_files).expanduser().resolve(strict=True)
         inputs = sorted({Path(value).expanduser().resolve(strict=True) for value in args.input})
+        rejects_path = (
+            Path(args.rejects).expanduser().resolve(strict=False) if args.rejects else None
+        )
         if output in inputs:
             raise ValueError("--out: must not also be an input")
         if output == scope_path:
             raise ValueError("--out: must not replace --in-scope-files")
+        if rejects_path is not None and rejects_path in {output, scope_path, *inputs}:
+            raise ValueError("--rejects: must differ from --out, --in-scope-files, and inputs")
         scope = read_scope(scope_path, repo_root)
         line_counts: dict[Path, int] = {}
         rows: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         for source in inputs:
-            with source.open(encoding="utf-8") as handle:
-                for number, line in enumerate(handle, 1):
+            label = source_label(source, output)
+            # Decode per line so one undecodable row is rejected on its own.
+            for number, raw in enumerate(source.read_bytes().split(b"\n"), 1):
+                try:
+                    line = raw.decode("utf-8")
                     if not line.strip():
                         continue
-                    try:
-                        row = json.loads(line)
-                        if not isinstance(row, dict):
-                            raise ValueError("expected a JSON object")
-                        rows.append(normalize_candidate(row, repo_root, scope, line_counts))
-                    except (ValueError, TypeError, OSError) as error:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("expected a JSON object")
+                    normalized = normalize_candidate(row, repo_root, scope, line_counts)
+                except (ValueError, TypeError, OSError, RecursionError) as error:
+                    if rejects_path is None:
                         raise ValueError(f"{source} row {number}: {error}") from error
+                    rejected.append({"input": label, "line": number, "reason": str(error)})
+                    continue
+                normalized["_source"] = f"{label}:{number}"
+                rows.append(normalized)
         combined = combine(rows)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        payload = "".join(
-            json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-            for row in combined
-        )
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=output.parent,
-                prefix=f".{output.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(payload)
-            temporary.replace(output)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-        print(f"Combined {len(rows)} candidate rows into {len(combined)} rows in {output}")
+        write_jsonl_atomically(output, combined)
+        summary = f"Combined {len(rows)} candidate rows into {len(combined)} rows in {output}"
+        if rejects_path is not None:
+            write_jsonl_atomically(rejects_path, rejected)
+            summary += f"; rejected {len(rejected)} invalid rows (see {rejects_path})"
+        print(summary)
     except (OSError, ValueError) as error:
         print(f"normalize_candidates: {error}", file=sys.stderr)
         raise SystemExit(2) from error

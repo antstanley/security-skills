@@ -3,7 +3,9 @@
 Use this reference when a Security workflow needs static repository evidence to support or defeat a supplied security claim.
 
 This is not a top-level workflow. It does not define input normalization,
-user-facing verdicts, scan ledgers, dynamic validation, or fix behavior. The calling skill owns those contracts.
+user-facing verdicts, scan ledgers, dynamic validation methods, or fix behavior.
+The calling skill owns those contracts. It does own the shared confidence scale
+below, which covers both static and dynamic evidence.
 
 ## Assessment Tuple
 
@@ -49,14 +51,42 @@ Before treating a static path as security-relevant, classify:
 
 Check whether untrusted input can reach the bug.
 
-## Static Confidence
+## Confidence Scale
 
-Calibrate confidence from evidence quality:
+This is the single confidence scale for Security workflows. Validation, triage,
+and the canonical `confidence.level` in `findings.json` all use these three
+levels; the final report's `Confidence Scale` table summarizes the same scale.
+Calibrate from the strongest evidence actually obtained, not from how dangerous
+the bug class sounds.
 
-- high: exact source/control/sink path, stated preconditions, relevant boundary evidence, and no material unresolved counterevidence
-- medium: plausible path with some direct evidence, but incomplete call-chain,
-  config, version, deployment, or boundary evidence
-- low: weak or indirect static support, significant ambiguity, or missing repository context
+- high: either of these, with no material unresolved reachability or
+  exploitability blocker:
+  - a complete, exact static source/control/sink path with stated preconditions,
+    relevant boundary evidence, and no material unresolved counterevidence
+  - a dynamic reproduction against the actual target code that demonstrates the
+    vulnerable behavior: a crashing PoC, a valgrind or ASan report, a
+    non-interactive debugger trace of the source-to-sink path, a focused unit or
+    integration test that asserts the vulnerable behavior, or an end-to-end
+    reproduction through the real interface (for a web bug, crafted HTTP
+    requests against the running application whose responses or side effects
+    show the vulnerable outcome; likewise for CLI, file, RPC, message, or
+    package-API interfaces)
+- medium: a plausible path with some direct evidence, but incomplete call-chain,
+  config, version, deployment, role-reachability, type-constraint, or
+  exploit-reliability evidence; or a dynamic attempt that exercised part of the
+  path but stopped short of showing the vulnerable outcome
+- low: weak or indirect support, significant ambiguity, or missing repository
+  context
+
+Dynamic reproduction is the strongest evidence. When a workflow has both a
+static trace and a dynamic reproduction, cite the reproduction in the confidence
+rationale. A complete static trace is not lowered merely because runtime proof
+was not attempted or the environment could not be brought up; record that as a
+proof gap, and lower confidence only when the gap leaves a real reachability,
+configuration, or exploitability question open.
+
+Counterevidence that clearly defeats the claim is not a confidence level. The
+calling skill records it with its own suppression or rejection outcome.
 
 Use proof gaps instead of filling in missing runtime, environment, policy, or deployment facts.
 
@@ -71,5 +101,5 @@ The calling skill decides the final schema and labels. The static assessment sho
 - supporting evidence
 - counterevidence
 - proof gaps
-- confidence based on static evidence quality
+- confidence from the confidence scale above
 - minimal next step when static evidence cannot settle the claim

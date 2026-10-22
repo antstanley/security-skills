@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,10 @@ TAIL_SKILLS = (
 )
 
 DEEP_SCAN_MIN_WORKERS = 4
+
+# Runtime facts the profiles evaluate. An unknown name is almost always a typo that
+# would otherwise leave a capability silently unreported.
+RUNTIME_CHECKS = ("delegation_available",)
 
 # Ambient Git environment variables would silently redirect the repository
 # probe below to another repository, so strip them the way target_identity.py
@@ -139,27 +144,65 @@ def python_command() -> str:
 
 
 def state_dir() -> Path:
-    """Return the directory holding durable state."""
+    """Return the configured directory holding durable state, before resolving links."""
     configured = os.environ.get("SECURITY_STATE_DIR")
     if configured:
-        return Path(configured).expanduser().resolve()
+        return Path(configured).expanduser().absolute()
     state_home = os.environ.get("XDG_STATE_HOME")
     root = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-    return (root / "security-skills").resolve()
+    return (root / "security-skills").absolute()
 
 
 def scan_root() -> Path:
-    """Return the directory that will hold scan bundles."""
+    """Return the configured directory for scan bundles, before resolving links."""
     configured = os.environ.get("SECURITY_SCAN_ROOT")
     if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path(tempfile.gettempdir()) / "security-scans").resolve()
+        return Path(configured).expanduser().absolute()
+    return (Path(tempfile.gettempdir()) / "security-scans").absolute()
+
+
+def is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def unsafe_ownership(configured: Path, resolved: Path) -> str | None:
+    """Return why another local user could plant or swap files under a directory."""
+    # Windows ACLs do not map onto POSIX owners and mode bits.
+    if os.name == "nt":
+        return None
+    user = os.geteuid()
+    try:
+        link = configured.lstat()
+        # Another user could repoint their own symlink later; root's links are trusted.
+        if stat.S_ISLNK(link.st_mode) and link.st_uid not in {user, 0}:
+            return f"{configured} is a symlink owned by another user (uid {link.st_uid})."
+        metadata = resolved.stat()
+    except OSError as exc:
+        return f"Could not inspect {resolved}: {exc.strerror or exc}"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return f"{resolved} is not a directory."
+    if metadata.st_uid != user:
+        return f"{resolved} is owned by another user (uid {metadata.st_uid})."
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{resolved} is writable by other users (mode {stat.S_IMODE(metadata.st_mode):o})."
+    return None
+
+
+def create_private_directory(path: Path) -> None:
+    """Create path for the current user only; leave an existing directory alone."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        return
+    if os.name != "nt":
+        # Pin the mode in case the umask removed owner bits.
+        path.chmod(0o700)
 
 
 def directory_is_writable(path: Path) -> bool:
     """Return whether a scan can create and remove files under path."""
     try:
-        path.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=path, prefix=".preflight-", delete=True):
             return True
     except OSError:
@@ -390,27 +433,83 @@ def check_git(profile: Profile, target: Path | None, report: Report) -> str | No
     return root
 
 
-def check_writable(label: str, path: Path, report: Report) -> None:
-    """Record whether the workflow can write under a required directory."""
-    if directory_is_writable(path):
+def resolve_repository(target: Path | None) -> tuple[Path | None, str | None, str | None]:
+    """Return the repository root, its kind, and the target's repo-relative scope."""
+    if target is None:
+        return None, None, None
+    root = git_repo_root(target)
+    if root is not None:
+        try:
+            repository = Path(root).resolve(strict=True)
+            scope = target.relative_to(repository).as_posix() or "."
+        except (OSError, ValueError):
+            # A toplevel that does not contain the target (for example through
+            # core.worktree) is not a usable repository root for this scan.
+            pass
+        else:
+            return repository, "git", scope
+    return target, "directory", "."
+
+
+def check_private_directory(
+    label: str,
+    variable: str,
+    configured: Path,
+    protected: tuple[Path, ...],
+    report: Report,
+) -> Path:
+    """Record whether scan output can live privately under a directory outside the target."""
+    resolved = configured.resolve()
+
+    def fail(reason: str, remediation: str) -> Path:
         report.results.append(
             Result(
                 capability=label,
-                status="pass",
+                status="fail",
                 severity="block",
-                reason=f"{path} is writable.",
+                reason=reason,
+                remediation=remediation,
             )
         )
-        return
+        return resolved
+
+    # Check containment before creating anything, so a misconfigured root never
+    # becomes a new directory inside the repository under review.
+    for root in protected:
+        if is_within(resolved, root):
+            return fail(
+                f"{resolved} is inside the scan target or its repository ({root}).",
+                f"Set {variable} to a directory outside {root}; scan output must never be "
+                "written into the repository under review.",
+            )
+    try:
+        create_private_directory(resolved)
+    except OSError as exc:
+        return fail(
+            f"Could not create {resolved}: {exc.strerror or exc}",
+            f"Set {variable} to a writable directory owned by the current user.",
+        )
+    problem = unsafe_ownership(configured, resolved)
+    if problem is not None:
+        return fail(
+            problem,
+            f"Set {variable} to a directory owned by the current user that other users cannot "
+            "write to, or fix the ownership and mode (chmod 700) of this one.",
+        )
+    if not directory_is_writable(resolved):
+        return fail(
+            f"{resolved} is not writable.",
+            f"Set {variable} to a writable directory owned by the current user.",
+        )
     report.results.append(
         Result(
             capability=label,
-            status="fail",
+            status="pass",
             severity="block",
-            reason=f"{path} is not writable.",
-            remediation=("Point SECURITY_SCAN_ROOT or SECURITY_STATE_DIR at a writable directory."),
+            reason=f"{resolved} is writable and private to the current user.",
         )
     )
+    return resolved
 
 
 def parse_runtime_check(value: str) -> tuple[str, bool]:
@@ -418,7 +517,22 @@ def parse_runtime_check(value: str) -> tuple[str, bool]:
     name, separator, raw = value.partition("=")
     if not separator or raw not in {"true", "false"}:
         raise argparse.ArgumentTypeError(f"runtime check must be <name>=true|false, got: {value}")
+    if name not in RUNTIME_CHECKS:
+        raise argparse.ArgumentTypeError(
+            f"unknown runtime check {name!r}; expected one of: {', '.join(RUNTIME_CHECKS)}"
+        )
     return name, raw == "true"
+
+
+def worker_slot_count(value: str) -> int:
+    """Parse a non-negative worker-slot count."""
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"worker slots must be an integer, got: {value}") from None
+    if count < 0:
+        raise argparse.ArgumentTypeError(f"worker slots must not be negative, got: {value}")
+    return count
 
 
 def parse_args() -> argparse.Namespace:
@@ -438,12 +552,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         type=parse_runtime_check,
         dest="runtime_checks",
-        help="runtime fact as <name>=true|false, for example delegation_available=true",
+        help=f"runtime fact as <name>=true|false; known names: {', '.join(RUNTIME_CHECKS)}",
     )
     parser.add_argument(
         "--worker-slots",
-        type=int,
-        help="number of concurrent subagents this session can run",
+        type=worker_slot_count,
+        help="number of concurrent subagents this session can run (0 or more)",
     )
     return parser.parse_args()
 
@@ -458,21 +572,31 @@ def main() -> int:
     check_skills(profile, set(args.available_skills), report)
     check_delegation(profile, runtime.get("delegation_available"), report)
     check_worker_slots(profile, args.worker_slots, report)
-    repo_root = check_git(profile, target, report)
+    check_git(profile, target, report)
+    repo_root, repo_kind, scope = resolve_repository(target)
 
-    scans = scan_root()
-    state = state_dir()
-    repo_name = Path(repo_root or (target or Path("repository"))).name
-    check_writable("scan_root_writable", scans, report)
-    check_writable("state_dir_writable", state, report)
+    protected = tuple(path for path in (target, repo_root) if path is not None)
+    scans = check_private_directory(
+        "scan_root_writable", "SECURITY_SCAN_ROOT", scan_root(), protected, report
+    )
+    state = check_private_directory(
+        "state_dir_writable", "SECURITY_STATE_DIR", state_dir(), protected, report
+    )
+    # Name the scan folder after the repository root, not a scoped subfolder, so every
+    # scan of one repository shares its folder and threat model instead of colliding
+    # with other repositories on a common folder name such as "src".
+    repo_name = (repo_root.name if repo_root is not None else "") or "repository"
 
     report.resolved = {
         "description": profile.description,
         "pythonCommand": python_command(),
         "target": str(target) if target is not None else None,
-        "repoRoot": repo_root,
+        "repoRoot": str(repo_root) if repo_root is not None else None,
+        "repoKind": repo_kind,
+        "scope": scope,
         "scanRoot": str(scans / repo_name),
         "stateDir": str(state),
+        "workerSlots": args.worker_slots,
     }
 
     json.dump(report.to_json(), sys.stdout, indent=2, sort_keys=False)

@@ -42,7 +42,7 @@ No explicit canonical threat-model summary was recorded.
 | --- | --- |
 | high | Direct evidence supports the finding with no material unresolved blocker. |
 | medium | Evidence supports a plausible issue, but material runtime or reachability proof remains. |
-| low | Evidence is incomplete and the item is retained only for explicit follow-up. |
+| low | Evidence is incomplete; the finding is reported so it can be followed up explicitly. |
 
 <a id="finding-1"></a>
 
@@ -64,6 +64,9 @@ An attacker-controlled path reaches a filesystem write without containment valid
 #### Validation
 
 Direct source trace reaches the filesystem write without a containment check. Validation details were not recorded separately.
+
+Counterevidence and remaining uncertainty:
+- None recorded beyond the confidence rationale.
 
 #### Dataflow
 

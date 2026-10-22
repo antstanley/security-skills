@@ -26,7 +26,7 @@ Use the shared scan artifact path conventions in `../../references/scan-artifact
 
 ### Compact Standard-Scan Mode
 
-When `security-scan`, or the centralized tail of `deep-security-scan`, explicitly invokes this skill in compact standard-scan mode, load the per-scan threat model and the enriched `<discovery_dir>/candidate_ledger.jsonl`. Analyze, in one invocation, every row whose validation disposition is `reportable` or `deferred`. Add one nested `attack_path` record to each row that enters the phase, using the compact record shape in `../../references/scan-artifacts.md`, while preserving every discovery and validation field and the original row order.
+When `security-scan`, or the centralized tail of `deep-security-scan`, explicitly invokes this skill in compact standard-scan mode, load the per-scan threat model and the enriched `<discovery_dir>/candidate_ledger.jsonl`. Analyze, in one invocation, every row whose validation disposition is `reportable` or `deferred`. Add one nested `attack_path` record to each row that enters the phase, using the compact record shape in `../../references/scan-artifacts.md`, while preserving every discovery and validation field and the original row order. When the row's `validation` record has `children`, analyze each child whose validation disposition is `reportable` or `deferred` separately and record it as an `attack_path.children` entry with the same `child_id`, its own decision, and its own severity; set the parent decision and severity as that reference describes.
 
 In this mode, the nested record replaces the per-finding attack-path report and receipt. Rewrite the ledger atomically. Keep attack-path facts, counterevidence, severity calibration, and policy adjustment as separate reasoning steps even though their output is compact. All reachability, instance-preservation, and evidence requirements still apply; only the artifact packaging changes.
 
@@ -46,7 +46,7 @@ In this mode, the nested record replaces the per-finding attack-path report and 
 5. Calibrate impact and likelihood from the repository evidence.
 6. Apply a separate final policy-adjustment pass mechanically using those facts and the calibrated severity.
 7. Record final policy decision `ignore` explicitly. Outside compact standard-scan mode, drop it from the surviving finding set; in compact mode, retain the ledger row for coverage mapping.
-8. In compact standard-scan mode, add the nested `attack_path` record to every candidate that entered the phase and atomically replace the ledger.
+8. In compact standard-scan mode, add the nested `attack_path` record, including any `children` entries, to every candidate that entered the phase and atomically replace the ledger.
 9. Outside compact standard-scan mode, save that finding's visible attack-path report and append one attack-path receipt per candidate id at the default paths from `../../references/scan-artifacts.md`. The receipt must record the candidate id, attack-path reportability decision, attack-path facts or exact proof gap, and attack-path artifact/report reference for that candidate finding.
 
 ## Scope and Attack Path Checklist
@@ -90,7 +90,7 @@ Apply severity and policy calibration using `references/severity-policy.md`.
 
 ## Output Contract
 
-In compact standard-scan mode, use the nested record defined in `../../references/scan-artifacts.md`. Every validation row with disposition `reportable` or `deferred` must receive exactly one attack-path decision. The record is the phase closure for this mode; do not also create a narrative report or receipt.
+In compact standard-scan mode, use the nested record defined in `../../references/scan-artifacts.md`. Every validation row with disposition `reportable` or `deferred` must receive exactly one attack-path record, and every validation child with disposition `reportable` or `deferred` must receive its own `attack_path.children` entry. The record is the phase closure for this mode; do not also create a narrative report or receipt.
 
 Outside compact standard-scan mode, use the following report contract.
 

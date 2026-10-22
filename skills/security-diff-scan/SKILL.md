@@ -39,7 +39,14 @@ Run the preflight in `references/preflight.md` with the `security_diff_scan` pro
 
 Follow the returned block/warn/suggest results and continue only after `ready`. If the result is `blocked` or `incomplete` with actionable remediation, present the exact reasons, apply only approved remediation, and rerun once. If it is still not ready, present the blocker and ask the user how to proceed; in a non-interactive run, report the blocker and stop. Do not abandon the scan for declined or unavailable remediation, a helper error, or a single non-ready rerun; preserve the scan directory and retry while recovery is still possible.
 
-Author `scan-manifest.json` as an unsealed draft: omit `scan.sealedAt` and `scan.artifacts`. Finalization supplies the timestamps, seal, artifact digests, and derived finding identities. Populate the draft's `scan.target` block by running the target-identity helper described in `references/scan-artifacts.md` with `--kind git_diff`, then add `displayName` and the recorded `baseRevision`/`headRevision`; never hand-compute `targetId` or `snapshotDigest`.
+Author `scan-manifest.json` as an unsealed draft: omit `scan.sealedAt` and `scan.artifacts`. Record `scan.startedAt`, and `scan.completedAt` when known; finalization supplies the seal, `sealedAt` (equal to `completedAt`), artifact digests, and derived finding identities, and stamps `completedAt` only when the draft omits it. Populate the draft's `scan.target` block by running the target-identity helper described in `references/scan-artifacts.md` with `--kind git_diff` and the pinned base and head from `Scan Target` below:
+
+```text
+<python_command> <skill_root>/scripts/target_identity.py --target <repo_root> --kind git_diff --base <base> --head <head>
+<python_command> <skill_root>/scripts/target_identity.py --target <repo_root> --kind git_diff --base <base> --mode local-patch
+```
+
+Use the first form for PR, commit, branch, and revision-range diffs, and the second for a local patch. Its `snapshotDigest` covers exactly the reviewed change set. Copy `kind`, `targetId`, `snapshotDigest`, `revision`, `baseRevision`, and `headRevision` when present from its output, then add `displayName`; never hand-compute `targetId` or `snapshotDigest`.
 
 ## Phase Sequence
 
@@ -124,12 +131,14 @@ Treat this asymmetry as intentional:
 
 ## Scan Target
 
-Resolve the exact Git-backed diff before starting:
+Resolve the exact Git-backed diff before starting. Every diff helper compares the `<base>` tree directly with the `<head>` tree (a two-dot comparison), so pin `<base>` to the commit the change actually starts from:
 
-- PR: compare base branch against current `HEAD`
-- commit: scan the target commit against its parent or requested baseline
-- branch diff: scan the requested merge-base to head range
-- local patch: scan staged and unstaged working-tree changes against the requested base
+- PR: `<base>` is the merge-base of the PR base branch and the PR head (`git merge-base <base-branch> <pr-head>`); `<head>` is the PR head
+- commit: `<base>` is the commit's parent or the requested baseline; `<head>` is the commit
+- branch diff: `<base>` is the merge-base of the requested base branch and the head; `<head>` is the branch head
+- local patch: scan staged and unstaged working-tree changes against the requested `<base>`, which defaults to `HEAD`; the target-identity digest also covers untracked files that are not ignored
+
+Using a branch tip instead of the merge-base as `<base>` would fold unrelated changes made on the base branch into the review.
 
 ## Diff-Scoped Discovery
 

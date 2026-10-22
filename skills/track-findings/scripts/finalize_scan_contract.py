@@ -18,7 +18,7 @@ import secrets
 import stat
 import sys
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, TextIO
 from urllib.parse import quote, urlsplit
@@ -29,18 +29,6 @@ SARIF_SCHEMA = "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-
 SEVERITIES = {"critical", "high", "medium", "low", "informational"}
 CONFIDENCES = {"high", "medium", "low"}
 TARGET_KINDS = {"git_revision", "git_worktree", "git_diff", "directory_snapshot"}
-TARGET_COORDINATE_FIELDS = {
-    "revision",
-    "baseRevision",
-    "headRevision",
-    "snapshotDigest",
-}
-TARGET_REQUIRED_COORDINATE_FIELDS = {
-    "git_revision": {"revision"},
-    "git_worktree": {"snapshotDigest"},
-    "git_diff": {"snapshotDigest"},
-    "directory_snapshot": {"snapshotDigest"},
-}
 DISPOSITIONS = {"reported", "no_issue_found", "rejected", "not_applicable", "needs_follow_up"}
 SARIF_LEVELS = {
     "critical": "error",
@@ -72,6 +60,43 @@ MAX_JSON_INTEGER = (1 << 53) - 1
 MAX_SCHEMA_NODES = 8192
 MAX_SCHEMA_COLLECTION_ENTRIES = 4096
 MAX_SCHEMA_APPLICATOR_EDGES = 128
+SCHEMA_ANNOTATION_KEYWORDS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$comment",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
+)
+SCHEMA_TYPE_NAMES = frozenset({"array", "boolean", "integer", "number", "object", "string", "null"})
+SCHEMA_SUBSCHEMA_KEYWORDS = frozenset({"items", "contains", "if", "then"})
+SCHEMA_NON_NEGATIVE_INTEGER_KEYWORDS = frozenset(
+    {"minLength", "minItems", "minContains", "maxContains"}
+)
+SCHEMA_NUMBER_KEYWORDS = frozenset({"minimum", "maximum"})
+SCHEMA_SUPPORTED_FORMATS = frozenset({"date-time"})
+SCHEMA_VALIDATION_KEYWORDS = (
+    SCHEMA_SUBSCHEMA_KEYWORDS
+    | SCHEMA_NON_NEGATIVE_INTEGER_KEYWORDS
+    | SCHEMA_NUMBER_KEYWORDS
+    | {
+        "type",
+        "const",
+        "enum",
+        "pattern",
+        "format",
+        "required",
+        "properties",
+        "additionalProperties",
+        "allOf",
+    }
+)
 SAFE_SCHEMA_PATTERNS = {
     r"^(?![^:/?#]+://[^/?#]*@)[^?#]+$",
     r"^security-snapshot/v1:sha256:[a-f0-9]{64}$",
@@ -99,8 +124,22 @@ def _reject_non_finite_json(value: str) -> None:
     raise ValueError(f"non-finite JSON number {value!r} is not supported")
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            # Callers wrap ValueError as a ContractError carrying the document name.
+            raise ValueError(f"duplicate JSON object key {key!r} is not supported")
+        result[key] = value
+    return result
+
+
 def _loads_json(value: str | bytes) -> Any:
-    return json.loads(value, parse_constant=_reject_non_finite_json)
+    return json.loads(
+        value,
+        parse_constant=_reject_non_finite_json,
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -118,11 +157,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ContractError(f"{path}: expected a JSON object")
     return payload
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_json_bytes(payload))
 
 
 def _generate_report_projection(
@@ -635,7 +669,7 @@ def _validate_remote(remote: str, context: str) -> None:
         )
 
 
-def _validate_date_time(value: str, context: str) -> None:
+def _validate_date_time(value: str, context: str) -> datetime:
     if not RFC3339_RE.fullmatch(value):
         raise ContractError(f"{context}: expected an RFC 3339 timestamp")
     try:
@@ -644,6 +678,25 @@ def _validate_date_time(value: str, context: str) -> None:
         raise ContractError(f"{context}: expected an RFC 3339 timestamp") from exc
     if parsed.tzinfo is None:
         raise ContractError(f"{context}: expected an RFC 3339 timestamp")
+    return parsed
+
+
+def _utc_timestamp_now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _validate_scan_timestamps(scan: dict[str, Any]) -> None:
+    started_at = _validate_date_time(
+        _require_str(scan, "startedAt", "manifest.scan"), "manifest.scan.startedAt"
+    )
+    completed_at = _validate_date_time(
+        _require_str(scan, "completedAt", "manifest.scan"), "manifest.scan.completedAt"
+    )
+    if started_at > completed_at:
+        raise ContractError("manifest.scan.startedAt: must not be later than completedAt")
+    sealed_at = scan.get("sealedAt")
+    if sealed_at is not None and sealed_at != scan["completedAt"]:
+        raise ContractError("manifest.scan.sealedAt: must match completedAt")
 
 
 def _validate_target(target: dict[str, Any]) -> None:
@@ -778,68 +831,33 @@ def _validate_derived_finding_identities(
             raise ContractError(f"{context}.fingerprints: does not match derived fingerprint")
 
 
-def _populate_unsealed_manifest_envelope(
-    manifest: dict[str, Any],
-    scan: dict[str, Any],
-    completion_binding: dict[str, Any] | None,
-) -> None:
-    """Populate non-semantic draft fields owned by finalization or an external caller."""
+def _populate_unsealed_manifest_envelope(manifest: dict[str, Any], scan: dict[str, Any]) -> None:
+    """Populate non-semantic draft fields owned by finalization.
+
+    Timestamps are never fabricated from one another. A draft ``startedAt`` wins;
+    ``SECURITY_STARTED_AT`` only supplies a missing ``startedAt``. A draft
+    ``completedAt`` wins; otherwise finalization stamps the current UTC time.
+    ``sealedAt`` is set to ``completedAt`` later in the finalization flow.
+    """
 
     manifest["documentType"] = "security.scan-manifest"
     manifest["schemaVersion"] = SCHEMA_VERSION
     scan["status"] = "completed"
     scan["coverageRef"] = "coverage.json"
     scan["findingsRef"] = "findings.json"
-    if completion_binding is None:
-        started_at = os.environ.get("SECURITY_STARTED_AT")
-        if started_at is not None:
-            _validate_date_time(started_at, "SECURITY_STARTED_AT")
-            # Deterministic sealing: prefer draft-provided timestamps, fall back
-            # to the override, and never stamp wall-clock time so repeated runs
-            # produce byte-identical bundles.
-            for field in ("startedAt", "completedAt"):
-                value = scan.get(field)
-                if not isinstance(value, str) or not value.strip():
-                    scan[field] = started_at
-        return
-
-    scan["id"] = completion_binding["scanId"]
-    scan["startedAt"] = completion_binding["startedAt"]
-    scan["completedAt"] = completion_binding["completedAt"]
-    scan["producer"] = copy.deepcopy(completion_binding["producer"])
-
-    target = scan.get("target")
-    if isinstance(target, dict):
-        _populate_unsealed_target_binding(target, completion_binding["target"])
-
-    scope = scan.get("scope")
-    if isinstance(scope, dict):
-        scope.update(copy.deepcopy(completion_binding["scope"]))
-
-
-def _populate_unsealed_target_binding(
-    target: dict[str, Any],
-    target_binding: dict[str, Any],
-) -> None:
-    """Replace caller-owned target coordinates without retaining incompatible drafts."""
-
-    target_kind = target.get("kind")
-    required_coordinates = (
-        TARGET_REQUIRED_COORDINATE_FIELDS.get(target_kind, set())
-        if isinstance(target_kind, str)
-        else set()
-    )
-    for field in TARGET_COORDINATE_FIELDS:
-        if field not in target_binding and field not in required_coordinates:
-            target.pop(field, None)
-    target.update(copy.deepcopy(target_binding))
+    started_at = scan.get("startedAt")
+    if not isinstance(started_at, str) or not started_at.strip():
+        override = os.environ.get("SECURITY_STARTED_AT")
+        if override is not None:
+            _validate_date_time(override, "SECURITY_STARTED_AT")
+            scan["startedAt"] = override
+    completed_at = scan.get("completedAt")
+    if not isinstance(completed_at, str) or not completed_at.strip():
+        scan["completedAt"] = _utc_timestamp_now()
 
 
 def _populate_unsealed_artifact_envelope(
-    manifest: dict[str, Any],
-    findings: dict[str, Any],
-    coverage: dict[str, Any],
-    completion_binding: dict[str, Any] | None,
+    findings: dict[str, Any], coverage: dict[str, Any]
 ) -> None:
     """Populate deterministic top-level draft fields after refs have been resolved."""
 
@@ -847,20 +865,6 @@ def _populate_unsealed_artifact_envelope(
     findings["schemaVersion"] = SCHEMA_VERSION
     coverage["documentType"] = "security.coverage"
     coverage["schemaVersion"] = SCHEMA_VERSION
-    if completion_binding is None:
-        return
-
-    scan_id = completion_binding["scanId"]
-    findings["scanId"] = scan_id
-    coverage["scanId"] = scan_id
-    coverage["mode"] = completion_binding["coverageMode"]
-
-    scan = _require_dict(manifest, "scan", "manifest")
-    scope = _require_dict(scan, "scope", "manifest.scan")
-    if "includePaths" in scope:
-        coverage["includePaths"] = copy.deepcopy(scope["includePaths"])
-    if "excludePaths" in scope:
-        coverage["excludePaths"] = copy.deepcopy(scope["excludePaths"])
 
 
 def _normalize_unsealed_open_questions(coverage: dict[str, Any]) -> None:
@@ -893,59 +897,48 @@ def _normalize_unsealed_open_questions(coverage: dict[str, Any]) -> None:
     coverage["openQuestions"] = normalized
 
 
-def _normalize_unsealed_deep_repository_inventory_strategy(
-    coverage: dict[str, Any],
-    *,
-    expected_coverage_mode: str | None,
-) -> None:
-    """Normalize the old Deep workflow label to the ordinary repository inventory."""
+def _validate_code_evidence_catalog(code_evidence: Any, context: str) -> set[str]:
+    if not isinstance(code_evidence, list):
+        raise ContractError(f"{context}: expected an array")
+    evidence_ids: set[str] = set()
+    for index, evidence in enumerate(code_evidence):
+        evidence_context = f"{context}[{index}]"
+        if not isinstance(evidence, dict):
+            raise ContractError(f"{evidence_context}: expected an object")
+        evidence_id = _require_str(evidence, "id", evidence_context)
+        if evidence_id in evidence_ids:
+            raise ContractError(f"{evidence_context}.id: duplicate code-evidence id")
+        evidence_ids.add(evidence_id)
+        _require_str(evidence, "code", evidence_context)
+        # Code evidence is projected into SARIF locations, so it obeys the same
+        # repository-relative path and line-range rules as finding locations.
+        _validate_location(evidence, evidence_context)
+    return evidence_ids
 
-    if (
-        expected_coverage_mode == "deep_repository"
-        and coverage.get("inventoryStrategy") == "deep_repository_repeated_discovery"
-    ):
-        coverage["inventoryStrategy"] = "repository"
 
-
-def _validate_completion_binding(
-    manifest: dict[str, Any],
-    findings: dict[str, Any],
-    coverage: dict[str, Any],
-    completion_binding: dict[str, Any] | None,
-) -> None:
-    """Verify caller-bound fields before an unsealed draft is written."""
-
-    if completion_binding is None:
-        return
-    scan = _require_dict(manifest, "scan", "manifest")
-    if scan.get("id") != completion_binding["scanId"]:
-        raise ContractError("manifest.scan.id: must match the recorded scan")
-    if scan.get("startedAt") != completion_binding["startedAt"]:
-        raise ContractError("manifest.scan.startedAt: must match the recorded scan")
-    if scan.get("completedAt") != completion_binding["completedAt"]:
-        raise ContractError("manifest.scan.completedAt: must match the recorded completion")
-    if scan.get("producer") != completion_binding["producer"]:
-        raise ContractError("manifest.scan.producer: must match the recorded producer")
-    target = _require_dict(scan, "target", "manifest.scan")
-    allowed_target_kinds = completion_binding["allowedTargetKinds"]
-    if target.get("kind") not in allowed_target_kinds:
-        raise ContractError("scan.target.kind: must match the recorded target")
-    for key, expected in completion_binding["target"].items():
-        if target.get(key) != expected:
-            raise ContractError(f"scan.target.{key}: must match the recorded target")
-    scope = _require_dict(scan, "scope", "manifest.scan")
-    for key, expected in completion_binding["scope"].items():
-        if scope.get(key) != expected:
-            raise ContractError(f"manifest.scan.scope.{key}: must match the recorded scan")
-    if findings.get("scanId") != completion_binding["scanId"]:
-        raise ContractError("findings.scanId: must match the recorded scan")
-    if coverage.get("scanId") != completion_binding["scanId"]:
-        raise ContractError("coverage.scanId: must match the recorded scan")
-    if coverage.get("mode") != completion_binding["coverageMode"]:
-        raise ContractError("coverage.mode: must match the recorded scan")
-    for key, expected in completion_binding["scope"].items():
-        if coverage.get(key) != expected:
-            raise ContractError(f"coverage.{key}: must match the recorded scan")
+def _validate_nested_evidence_refs(value: Any, context: str, evidence_ids: set[str]) -> None:
+    pending: list[tuple[Any, str]] = [(value, context)]
+    while pending:
+        item, location = pending.pop()
+        if isinstance(item, list):
+            pending.extend((child, f"{location}[{index}]") for index, child in enumerate(item))
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key, child in item.items():
+            child_location = f"{location}.{key}"
+            if key in {"evidenceRefs", "evidence_refs"}:
+                if not isinstance(child, list) or any(
+                    not isinstance(ref, str) or not ref for ref in child
+                ):
+                    raise ContractError(f"{child_location}: expected non-empty strings")
+                unknown_refs = sorted(set(child) - evidence_ids)
+                if unknown_refs:
+                    raise ContractError(
+                        f"{child_location}: unknown code-evidence ids: " + ", ".join(unknown_refs)
+                    )
+                continue
+            pending.append((child, child_location))
 
 
 def _validate_finding(finding: dict[str, Any], context: str) -> None:
@@ -989,34 +982,18 @@ def _validate_finding(finding: dict[str, Any], context: str) -> None:
             raise ContractError(f"{context}.locations[{index}]: expected an object")
         _validate_location(location, f"{context}.locations[{index}]")
 
-    evidence_ids: set[str] = set()
-    code_evidence = finding.get("codeEvidence")
-    if code_evidence is not None:
-        if not isinstance(code_evidence, list):
-            raise ContractError(f"{context}.codeEvidence: expected an array")
-        for index, evidence in enumerate(code_evidence):
-            evidence_context = f"{context}.codeEvidence[{index}]"
-            if not isinstance(evidence, dict):
-                raise ContractError(f"{evidence_context}: expected an object")
-            evidence_id = _require_str(evidence, "id", evidence_context)
-            if evidence_id in evidence_ids:
-                raise ContractError(f"{evidence_context}.id: duplicate code-evidence id")
-            evidence_ids.add(evidence_id)
-            _require_str(evidence, "code", evidence_context)
-
-    for section_name in ("rootCause", "validation", "attackPath"):
-        section = finding.get(section_name)
-        if not isinstance(section, dict) or "evidenceRefs" not in section:
-            continue
-        refs = section["evidenceRefs"]
-        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
-            raise ContractError(f"{context}.{section_name}.evidenceRefs: expected strings")
-        unknown_refs = sorted(set(refs) - evidence_ids)
-        if unknown_refs:
-            raise ContractError(
-                f"{context}.{section_name}.evidenceRefs: unknown code-evidence ids: "
-                + ", ".join(unknown_refs)
+    # The report projection reads the camelCase catalog and falls back to the
+    # snake_case spelling, so validate both and resolve refs against the same one.
+    catalog_ids: dict[str, set[str]] = {}
+    for catalog_key in ("codeEvidence", "code_evidence"):
+        if catalog_key in finding:
+            catalog_ids[catalog_key] = _validate_code_evidence_catalog(
+                finding[catalog_key], f"{context}.{catalog_key}"
             )
+    evidence_ids = catalog_ids.get("codeEvidence", catalog_ids.get("code_evidence", set()))
+    for key, child in finding.items():
+        if key not in {"codeEvidence", "code_evidence", "extensions"}:
+            _validate_nested_evidence_refs(child, f"{context}.{key}", evidence_ids)
 
     provenance = _require_dict(finding, "provenance", context)
     _require_str(provenance, "source", f"{context}.provenance")
@@ -1071,9 +1048,68 @@ def _validate_coverage(manifest: dict[str, Any], coverage: dict[str, Any], scan_
     for field in ("explicitExclusions", "deferred"):
         if not isinstance(coverage.get(field, []), list):
             raise ContractError(f"coverage.{field}: expected an array")
-    if completeness == "complete" and (has_needs_follow_up or coverage.get("deferred")):
+    deferred = coverage.get("deferred", [])
+    for index, item in enumerate(deferred):
+        _validate_deferred_unit(item, f"coverage.deferred[{index}]", surface_ids)
+    if completeness == "complete" and (has_needs_follow_up or deferred):
         raise ContractError("coverage.completeness: complete coverage cannot have deferred work")
+    if completeness == "partial" and not (has_needs_follow_up or deferred):
+        raise ContractError(
+            "coverage.completeness: partial coverage requires a deferred entry or a "
+            "needs_follow_up surface"
+        )
     _require_safe_json_value(coverage, "coverage.json")
+
+
+def _validate_deferred_unit(item: Any, context: str, surface_ids: set[str]) -> None:
+    if not isinstance(item, dict):
+        raise ContractError(f"{context}: expected an object")
+    _require_str(item, "id", context)
+    _require_str(item, "reason", context)
+    paths = item.get("paths", [])
+    if not isinstance(paths, list):
+        raise ContractError(f"{context}.paths: expected an array")
+    for index, path in enumerate(paths):
+        if not isinstance(path, str):
+            raise ContractError(f"{context}.paths[{index}]: expected a string")
+        _require_safe_relative_path(path, f"{context}.paths[{index}]", allow_dot=True)
+    referenced = item.get("surfaceIds", [])
+    if not isinstance(referenced, list):
+        raise ContractError(f"{context}.surfaceIds: expected an array")
+    for index, surface_id in enumerate(referenced):
+        if not isinstance(surface_id, str) or surface_id not in surface_ids:
+            raise ContractError(
+                f"{context}.surfaceIds[{index}]: unknown coverage surface id {surface_id!r}"
+            )
+
+
+def _validate_coverage_findings_consistency(
+    findings: dict[str, Any], coverage: dict[str, Any]
+) -> None:
+    """Reject surface dispositions that contradict the presence of findings.
+
+    Findings carry no surface reference, so this checks the document-level
+    implication of the disposition table rather than a per-surface mapping.
+    """
+
+    finding_rows = _require_list(findings, "findings", "findings")
+    surfaces = [
+        surface
+        for surface in _require_list(coverage, "surfaces", "coverage")
+        if isinstance(surface, dict)
+    ]
+    reported = [
+        surface.get("id") for surface in surfaces if surface.get("disposition") == "reported"
+    ]
+    if reported and not finding_rows:
+        raise ContractError(
+            "coverage.surfaces: surfaces marked reported require at least one finding: "
+            + ", ".join(sorted(str(surface_id) for surface_id in reported))
+        )
+    if finding_rows and surfaces and not reported:
+        raise ContractError(
+            "coverage.surfaces: findings exist but no reviewed surface is marked reported"
+        )
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> None:
@@ -1084,6 +1120,7 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     scan = _require_dict(manifest, "scan", "manifest")
     for key in ("id", "startedAt", "completedAt", "sealedAt"):
         _require_str(scan, key, "manifest.scan")
+    _validate_scan_timestamps(scan)
     if scan.get("status") != "completed":
         raise ContractError("manifest.scan.status: expected completed")
     producer = _require_dict(scan, "producer", "manifest.scan")
@@ -1161,6 +1198,8 @@ def _schema_type_matches(value: Any, expected: str) -> bool:
 
 
 def _validate_schema_node(value: Any, schema: dict[str, Any], context: str) -> None:
+    # Only keywords in SCHEMA_*_KEYWORDS are evaluated; _require_safe_schema
+    # rejects every other keyword so a schema cannot validate vacuously.
     expected = schema.get("type")
     if isinstance(expected, list):
         if not any(_schema_type_matches(value, item) for item in expected):
@@ -1204,19 +1243,19 @@ def _validate_schema_node(value: Any, schema: dict[str, Any], context: str) -> N
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
                 _validate_schema_node(item, item_schema, f"{context}[{index}]")
+    for item_schema in schema.get("allOf", []):
+        _validate_schema_node(value, item_schema, context)
+    condition = schema.get("if")
+    if isinstance(condition, dict):
+        try:
+            _validate_schema_node(value, condition, context)
+        except ContractError:
+            pass
+        else:
+            then_schema = schema.get("then")
+            if isinstance(then_schema, dict):
+                _validate_schema_node(value, then_schema, context)
     if isinstance(value, dict):
-        for item_schema in schema.get("allOf", []):
-            _validate_schema_node(value, item_schema, context)
-        condition = schema.get("if")
-        if isinstance(condition, dict):
-            try:
-                _validate_schema_node(value, condition, context)
-            except ContractError:
-                pass
-            else:
-                then_schema = schema.get("then")
-                if isinstance(then_schema, dict):
-                    _validate_schema_node(value, then_schema, context)
         for key in schema.get("required", []):
             if key not in value:
                 raise ContractError(f"{context}.{key}: missing required schema property")
@@ -1235,96 +1274,117 @@ def validate_against_schema(payload: dict[str, Any], schema_path: Path) -> None:
     _validate_schema_node(payload, schema, schema_path.stem)
 
 
+def _schema_subschema(child: Any, location: str, context: str) -> dict[str, Any]:
+    if not isinstance(child, dict):
+        raise ContractError(
+            f"{context}: {location}: expected an object subschema; boolean and array "
+            "subschemas are not supported"
+        )
+    return child
+
+
+def _require_schema_keyword_value(keyword: str, child: Any, location: str, context: str) -> None:
+    """Reject keyword values the minimal validator would misread or ignore."""
+
+    invalid = f"{context}: {location}: unsupported value for JSON Schema keyword {keyword!r}"
+    if keyword == "type":
+        names = child if isinstance(child, list) else [child]
+        if (
+            not names
+            or any(not isinstance(name, str) or name not in SCHEMA_TYPE_NAMES for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise ContractError(invalid)
+    elif keyword in SCHEMA_NON_NEGATIVE_INTEGER_KEYWORDS:
+        if not isinstance(child, int) or isinstance(child, bool) or child < 0:
+            raise ContractError(invalid)
+    elif keyword in SCHEMA_NUMBER_KEYWORDS:
+        if not isinstance(child, (int, float)) or isinstance(child, bool):
+            raise ContractError(invalid)
+    elif keyword == "enum":
+        if not isinstance(child, list) or not child:
+            raise ContractError(invalid)
+    elif keyword == "pattern":
+        if not isinstance(child, str) or child not in SAFE_SCHEMA_PATTERNS:
+            raise ContractError(f"{context}: {location}: unsupported JSON Schema pattern")
+    elif keyword == "format":
+        if child not in SCHEMA_SUPPORTED_FORMATS:
+            raise ContractError(invalid)
+    elif keyword == "required":
+        if not isinstance(child, list) or any(not isinstance(name, str) for name in child):
+            raise ContractError(invalid)
+    elif keyword == "additionalProperties":
+        # The validator only implements the boolean form.
+        if not isinstance(child, bool):
+            raise ContractError(invalid)
+    elif keyword == "properties":
+        if not isinstance(child, dict):
+            raise ContractError(invalid)
+    elif keyword == "allOf":
+        if not isinstance(child, list) or not child:
+            raise ContractError(invalid)
+
+
 def _require_safe_schema(schema: dict[str, Any], context: str) -> None:
-    pending: list[tuple[Any, bool]] = [(schema, True)]
+    """Allow only the JSON Schema subset that _validate_schema_node evaluates.
+
+    Unknown keywords, boolean or array subschemas, and malformed keyword values
+    are rejected so a schema edit cannot pass this gate yet validate vacuously.
+    """
+
+    pending: list[tuple[Any, str, bool]] = [(schema, "#", True)]
     nodes = 0
     applicator_edges = 0
-    # Reject every applicator the minimal validator does not implement, so a
-    # schema edit cannot pass the safety gate yet validate vacuously.
-    unsupported_keywords = {
-        "$async",
-        "$ref",
-        "$dynamicRef",
-        "$recursiveRef",
-        "anyOf",
-        "oneOf",
-        "not",
-        "else",
-        "prefixItems",
-        "patternProperties",
-        "propertyNames",
-        "dependentSchemas",
-        "dependencies",
-        "uniqueItems",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-    }
     while pending:
-        value, is_schema = pending.pop()
+        value, location, is_schema = pending.pop()
         nodes += 1
         if nodes > MAX_SCHEMA_NODES:
             raise ContractError(
                 f"{context}: JSON Schema exceeds the {MAX_SCHEMA_NODES}-node complexity limit"
             )
-        if isinstance(value, list):
-            if len(value) > MAX_SCHEMA_COLLECTION_ENTRIES:
-                raise ContractError(
-                    f"{context}: JSON Schema exceeds the "
-                    f"{MAX_SCHEMA_COLLECTION_ENTRIES}-entry collection limit"
-                )
-            pending.extend((child, is_schema) for child in value)
-            continue
-        if not isinstance(value, dict):
-            continue
-        if len(value) > MAX_SCHEMA_COLLECTION_ENTRIES:
+        if isinstance(value, (dict, list)) and len(value) > MAX_SCHEMA_COLLECTION_ENTRIES:
             raise ContractError(
                 f"{context}: JSON Schema exceeds the "
                 f"{MAX_SCHEMA_COLLECTION_ENTRIES}-entry collection limit"
             )
-        for keyword, child in value.items():
-            if not is_schema:
-                pending.append((child, False))
+        if not is_schema:
+            children = value.values() if isinstance(value, dict) else value
+            if isinstance(value, (dict, list)):
+                pending.extend((child, location, False) for child in children)
+            continue
+        schema_node = _schema_subschema(value, location, context)
+        for keyword, child in schema_node.items():
+            child_location = f"{location}/{keyword}"
+            if keyword in SCHEMA_ANNOTATION_KEYWORDS:
+                pending.append((child, child_location, False))
                 continue
-            if keyword in unsupported_keywords:
-                raise ContractError(f"{context}: unsupported JSON Schema keyword")
-            if keyword == "additionalProperties" and not isinstance(child, bool):
-                # The validator only implements the boolean form.
-                raise ContractError(f"{context}: unsupported JSON Schema keyword")
-            if keyword in {"if", "then", "items", "contains"} and isinstance(child, bool):
-                # The validator only implements the schema form; a boolean here
-                # would be accepted by the gate but validate vacuously.
-                raise ContractError(f"{context}: unsupported JSON Schema keyword")
-            edges = 0
-            if keyword == "allOf" and isinstance(child, list):
-                edges = len(child)
-            elif keyword in {
-                "if",
-                "then",
-                "items",
-                "contains",
-                "additionalProperties",
-            } and isinstance(child, (dict, bool)):
-                edges = 1
-            elif keyword in {"properties", "$defs", "definitions"} and isinstance(child, dict):
-                edges = len(child)
-            applicator_edges += edges
+            if keyword not in SCHEMA_VALIDATION_KEYWORDS:
+                raise ContractError(
+                    f"{context}: {child_location}: unsupported JSON Schema keyword {keyword!r}"
+                )
+            _require_schema_keyword_value(keyword, child, child_location, context)
+            subschemas: list[tuple[Any, str]] = []
+            if keyword in SCHEMA_SUBSCHEMA_KEYWORDS:
+                subschemas = [(child, child_location)]
+            elif keyword == "allOf":
+                subschemas = [
+                    (item, f"{child_location}/{index}") for index, item in enumerate(child)
+                ]
+            elif keyword == "properties":
+                subschemas = [(item, f"{child_location}/{name}") for name, item in child.items()]
+            else:
+                if keyword in {"const", "enum"}:
+                    pending.append((child, child_location, False))
+                continue
+            applicator_edges += len(subschemas)
             if applicator_edges > MAX_SCHEMA_APPLICATOR_EDGES:
                 raise ContractError(
                     f"{context}: JSON Schema exceeds the "
                     f"{MAX_SCHEMA_APPLICATOR_EDGES}-edge applicator limit"
                 )
-            if keyword == "pattern" and isinstance(child, str):
-                if child not in SAFE_SCHEMA_PATTERNS:
-                    raise ContractError(f"{context}: unsupported JSON Schema pattern")
-            if keyword in {"properties", "$defs", "definitions"} and isinstance(child, dict):
-                pending.extend((child_schema, True) for child_schema in child.values())
-                continue
-            pending.append(
-                (
-                    child,
-                    keyword not in {"const", "enum", "default", "examples", "dependentRequired"},
-                )
-            )
+            for subschema, subschema_location in subschemas:
+                _schema_subschema(subschema, subschema_location, context)
+                pending.append((subschema, subschema_location, True))
 
 
 def _validate_canonical_schemas_before_projection(
@@ -1714,9 +1774,19 @@ def _validate_sealed_coverage_receipts(scan: dict[str, Any], coverage: dict[str,
         _require_safe_relative_path(artifact["path"], "sealed artifact path")
         for artifact in scan["artifacts"]
     }
-    for ref in _coverage_receipt_refs(coverage):
+    receipt_refs = _coverage_receipt_refs(coverage)
+    for ref in receipt_refs:
         if ref not in artifact_paths:
             raise ContractError(f"coverage receipt is missing from sealed artifacts: {ref}")
+    # The seal covers only the canonical documents and coverage evidence receipts;
+    # report.md, exports, write-ups, and other projections stay outside it.
+    allowed_paths = {scan["findingsRef"], scan["coverageRef"], *receipt_refs}
+    unexpected = sorted(artifact_paths - allowed_paths)
+    if unexpected:
+        raise ContractError(
+            "manifest.scan.artifacts: seal may only include findings.json, coverage.json, "
+            "and coverage receipt files; unexpected: " + ", ".join(unexpected)
+        )
 
 
 def _validate_existing_seal(
@@ -1782,6 +1852,7 @@ def _read_sealed_scan(
     _validate_manifest(manifest)
     _validate_findings(manifest, findings)
     _validate_coverage(manifest, coverage, scan_dir)
+    _validate_coverage_findings_consistency(findings, coverage)
     _validate_sealed_coverage_receipts(scan, coverage)
     validate_against_schema(manifest, schema_dir / "scan-manifest.schema.json")
     validate_against_schema(findings, schema_dir / "findings.schema.json")
@@ -2048,9 +2119,6 @@ PreparedScanFinalization = tuple[
 def _prepare_scan_finalization(
     scan_dir: Path,
     schema_dir: Path | None = None,
-    *,
-    expected_coverage_mode: str | None = None,
-    completion_binding: dict[str, Any] | None = None,
 ) -> PreparedScanFinalization:
     """Read, populate, and validate a scan without writing any output files."""
 
@@ -2060,7 +2128,7 @@ def _prepare_scan_finalization(
     scan = _require_dict(manifest, "scan", "manifest")
     was_sealed = scan.get("sealedAt") is not None or scan.get("artifacts") is not None
     if not was_sealed:
-        _populate_unsealed_manifest_envelope(manifest, scan, completion_binding)
+        _populate_unsealed_manifest_envelope(manifest, scan)
     _validate_contract_refs(scan)
     findings, findings_input_bytes = _read_scan_local_json_bytes(
         scan_dir, scan["findingsRef"], scan["findingsRef"]
@@ -2069,27 +2137,13 @@ def _prepare_scan_finalization(
         scan_dir, scan["coverageRef"], scan["coverageRef"]
     )
     if not was_sealed:
-        _populate_unsealed_artifact_envelope(manifest, findings, coverage, completion_binding)
-        _normalize_unsealed_deep_repository_inventory_strategy(
-            coverage,
-            expected_coverage_mode=expected_coverage_mode,
-        )
+        _populate_unsealed_artifact_envelope(findings, coverage)
         _normalize_unsealed_open_questions(coverage)
 
     if manifest.get("schemaVersion") != SCHEMA_VERSION:
         raise ContractError(f"manifest.schemaVersion: expected {SCHEMA_VERSION}")
     if scan.get("status") != "completed":
         raise ContractError("manifest.scan.status: expected completed before sealing")
-    if (
-        expected_coverage_mode is not None
-        and completion_binding is not None
-        and completion_binding["coverageMode"] != expected_coverage_mode
-    ):
-        raise ContractError("completion binding coverage mode does not match expected mode")
-    if expected_coverage_mode is not None and coverage.get("mode") != expected_coverage_mode:
-        raise ContractError(
-            f"coverage.mode: must match selected scan mode {expected_coverage_mode}"
-        )
     _validate_existing_seal(
         scan_dir,
         scan,
@@ -2099,16 +2153,16 @@ def _prepare_scan_finalization(
         },
     )
     scan["sealedAt"] = _require_str(scan, "completedAt", "manifest.scan")
+    _validate_scan_timestamps(scan)
     _validate_target(_require_dict(scan, "target", "manifest.scan"))
-    _validate_completion_binding(manifest, findings, coverage, completion_binding)
     if was_sealed:
         _validate_findings(manifest, findings)
-    if was_sealed:
         _validate_derived_finding_identities(manifest, findings)
     else:
         _populate_unsealed_finding_identities(manifest, findings)
     _validate_findings(manifest, findings)
     _validate_coverage(manifest, coverage, scan_dir)
+    _validate_coverage_findings_consistency(findings, coverage)
     _validate_canonical_schemas_before_projection(manifest, findings, coverage, schema_dir)
     _require_derived_writeup_files(scan_dir, findings)
     _require_hardening_portfolio_file(scan_dir, scan)
@@ -2195,16 +2249,8 @@ def finalize_scan(
     scan_dir: Path,
     schema_dir: Path | None = None,
     source_root: Path | None = None,
-    *,
-    expected_coverage_mode: str | None = None,
-    completion_binding: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    prepared = _prepare_scan_finalization(
-        scan_dir,
-        schema_dir,
-        expected_coverage_mode=expected_coverage_mode,
-        completion_binding=completion_binding,
-    )
+    prepared = _prepare_scan_finalization(scan_dir, schema_dir)
     return _write_prepared_scan_finalization(prepared, source_root)
 
 

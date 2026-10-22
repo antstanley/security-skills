@@ -106,7 +106,9 @@ Run `preflight.py` from an installed skill folder when you change preflight logi
 cd skills/security-scan
 SECURITY_STATE_DIR=/tmp/ss-state SECURITY_SCAN_ROOT=/tmp/ss-scans \
   python3 scripts/preflight.py --profile security_scan --target <path-to-repo-under-review> \
-  --runtime-check delegation_available=true --available-skill threat-model
+  --runtime-check delegation_available=true --available-skill threat-model \
+  --available-skill finding-discovery --available-skill validation \
+  --available-skill attack-path-analysis
 ```
 
 Clean up any `__pycache__` or `.ruff_cache` folders you created. They are git-ignored,

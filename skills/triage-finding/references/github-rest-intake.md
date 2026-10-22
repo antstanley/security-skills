@@ -58,32 +58,26 @@ GitHub Issues are not part of `all` and are not a default source. Fetch and norm
 
 ## REST-Only Finding Retrieval
 
-Use GitHub REST endpoints for all finding retrieval. Do not use a GitHub MCP server to fetch repository finding data, even if one is configured or the user explicitly asks to use it. If the user asks for it, use it only for auth token acquisition when it exposes one, then continue with REST.
-
-An MCP server is auth-only in this workflow because its tool surface does not cover all required GitHub security endpoints for code scanning,
-Dependabot alerts, repository security advisories, and private vulnerability reports.
+Use GitHub REST endpoints for all finding retrieval. Do not use a GitHub MCP server to fetch repository finding data or to acquire credentials, even if one is configured or the user explicitly asks to use it. Its tool surface does not cover all required GitHub security endpoints for code scanning, Dependabot alerts, repository security advisories, and private vulnerability reports.
 
 ## Auth Priority
 
-Acquire a REST token in this order:
+Keep credentials out of the conversation. Never run a command whose output is a token, and never print, log, echo, or include a token in output, files, or notes.
 
-1. `gh auth token`, if `gh` is installed and authenticated.
-2. A GitHub MCP server's token acquisition tool, if one is configured and exposes one.
-3. `GH_TOKEN`.
-4. `GITHUB_TOKEN`.
-5. `git credential fill` for `github.com`.
+1. Prefer `gh api` when `gh` is installed and `gh auth status --hostname github.com` succeeds. `gh` attaches its own credentials, so the token never enters the agent context. Pass the complete endpoint as one shell-quoted argument, use `--hostname github.com`, and use `--paginate` for list requests.
+2. Otherwise use `GH_TOKEN`, then `GITHUB_TOKEN`, from the environment. Reference the variable only inside the request command so the shell expands it at run time, for example by piping `printf 'Authorization: Bearer %s\n' "$GH_TOKEN"` into a client that reads the header from standard input. Do not echo, inspect, or copy the value.
 
-Never print, log, echo, or include the token in output. If a command returns a token, store it only in process memory for the request headers.
+Do not acquire a token with `gh auth token`, an MCP token tool, or `git credential fill`, and do not ask the user to paste a token into the conversation.
 
 Use these headers on REST requests:
 
 ```text
-Authorization: Bearer <token>
+Authorization: Bearer <token>   (added by gh, or expanded from the environment)
 Accept: application/vnd.github+json
 X-GitHub-Api-Version: 2022-11-28
 ```
 
-If no REST auth source is available, ask the user to connect GitHub or provide one of the supported auth sources above. Do not continue with unauthenticated requests for private or owner-only security data.
+If neither route is available, ask the user to authenticate `gh` or to set `GH_TOKEN` in the agent's environment. Do not continue with unauthenticated requests for private or owner-only security data.
 
 ## Endpoints
 
@@ -160,7 +154,7 @@ Follow the `Link` response header until there is no `rel="next"` URL. Keep `per_
 
 ## Status Handling
 
-- `401` or `403`: REST auth is missing, expired, lacks permission, or the organization policy blocks access. Ask the user to connect GitHub or provide credentials with access to the selected security source.
+- `401` or `403`: REST auth is missing, expired, lacks permission, or the organization policy blocks access. Ask the user to authenticate `gh` or set `GH_TOKEN` for an account with access to the selected security source.
 - `404`: the repository, feature, or item is absent; the feature may be disabled; or the token does not have access. Report this as an intake blocker for that source, not as proof that there are no findings.
 - `200 []`: the endpoint is accessible and there are no matching findings for the selected source and filters.
 

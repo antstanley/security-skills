@@ -12,6 +12,8 @@ A completed semantic bundle contains these files under `<scan_dir>`:
 
 Canonical UTF-8 document sizes are bounded consistently by the authoring workflow and the bundled finalizer and validator scripts: `scan-manifest.json` is limited to 16 MiB, `findings.json` to 128 MiB, and `coverage.json` to 32 MiB. Finalization rejects oversized inputs or generated documents before sealing or changing scan outputs. Keep detailed evidence in scan-local artifacts and reference it from the canonical summaries.
 
+Canonical documents and schemas must not repeat a property name within one JSON object; finalization and validation reject duplicate keys rather than keeping the last value.
+
 Optional structured finding details used by rich consumers are documented in `finding-detail-fields.md`. They remain part of each semantic finding record, not a projection parsed from a readable report.
 
 The existing `report.md` output remains a readable projection. Generated exports such as SARIF are also downstream projections, not part of the canonical semantic source of truth.
@@ -24,7 +26,16 @@ Retention is an explicit consumer decision. Producing a completed-scan bundle mu
 
 ## Manifest Semantics
 
-A sealed manifest records the completed timestamp and hashes for the canonical documents and immutable evidence receipts included in that bundle. Readable reports and generated exports are projections and are not included in the canonical seal. Later adapters may read the sealed bundle to create projections, but must not mutate the sealed manifest or canonical documents. Store projections separately. Every sealed manifest includes exactly one artifact record for each canonical JSON document, and artifact paths must not repeat.
+A sealed manifest records the completed timestamp and hashes for the canonical documents and immutable evidence receipts included in that bundle. Readable reports and generated exports are projections and are not included in the canonical seal. Later adapters may read the sealed bundle to create projections, but must not mutate the sealed manifest or canonical documents. Store projections separately. Every sealed manifest includes exactly one artifact record for each canonical JSON document, and artifact paths must not repeat. The seal contains only `findings.json`, `coverage.json`, and the coverage receipt files referenced from `coverage.surfaces[].receiptRefs`; finalization and validation reject any other artifact record, including `report.md`, exports, write-ups, hardening documents, and `scan-manifest.json` itself.
+
+Timestamps are RFC 3339 values and are never derived from one another:
+
+- `startedAt` comes from the draft manifest. Only when the draft omits it does finalization use the `SECURITY_STARTED_AT` environment variable; that variable never supplies `completedAt` or `sealedAt`.
+- `completedAt` comes from the draft manifest. When the draft omits it, finalization stamps the current UTC time, to the second, in the form `YYYY-MM-DDTHH:MM:SSZ`.
+- `sealedAt` always equals `completedAt`.
+- `startedAt` must not be later than `completedAt`.
+
+A scan without a `startedAt` from either source cannot be finalized. Repeated finalization of an already sealed bundle keeps its recorded timestamps, so it is byte-identical apart from regenerated projections. Two finalizations of the same unsealed draft produce identical bundles only when the draft records `completedAt`.
 
 ## Target Snapshots
 
@@ -127,7 +138,16 @@ Map detailed ledger closure into completed surface summaries in this order:
 | Otherwise, an applicable surface was checked and no candidate survived | `no_issue_found` |
 | Otherwise, the surface is not applicable | `not_applicable` |
 
-Record each explicit exclusion with a `pattern` and `reason`. Record each deferred unit with a stable `id`, a `reason`, and optional `paths` or `surfaceIds`.
+Record each explicit exclusion with a `pattern` and `reason`. Record each deferred unit with a stable `id`, a `reason`, and optional `paths` or `surfaceIds`. Deferred `paths` must be safe repository-relative POSIX paths (no absolute paths, `..` segments, or backslashes), and every deferred `surfaceIds` entry must name a surface `id` recorded in the same `coverage.json`.
+
+Finalization and validation enforce these consistency rules:
+
+- `complete` coverage has no `deferred` entries and no `needs_follow_up` surface.
+- `partial` coverage has at least one `deferred` entry or `needs_follow_up` surface.
+- A surface marked `reported` requires at least one finding in `findings.json`.
+- When `findings.json` contains findings and coverage lists any surfaces, at least one surface is marked `reported`.
+
+Findings do not reference surfaces, so these checks apply to the documents as a whole rather than to each surface individually.
 
 Detailed ledgers remain under the numbered scan artifact directories.
 Receipt references must point to regular non-symlink files under `artifacts/`.
@@ -137,12 +157,14 @@ Receipt references must point to regular non-symlink files under `artifacts/`.
 
 The three canonical JSON files are also the only semantic inputs to final report generation. Producers must not author `report.md`; finalization deterministically projects it after validating the canonical seal. The report remains an unsealed downstream projection and can be regenerated without changing canonical JSON or evidence artifacts.
 
+The bundled scan-contract validator regenerates the report from the sealed canonical JSON with the same projection finalization uses, checks `report.md` against the shared report-format rules, and requires `report.md` to match the regenerated bytes exactly. A missing, hand-edited, or stale report fails validation; run finalization again on the sealed bundle to regenerate it.
+
 Record report-specific semantics without duplicating data already represented elsewhere:
 
 - `scan.scope`: optional narrative `summary`, reviewed artifact names, runtime/test status, validation mode, scan context, and limitations. Include/exclude paths remain the authoritative scope boundaries.
 - `scan.threatModel`: concise summary plus assets, trust boundaries, attacker capabilities, security objectives, and assumptions.
 - finding `validation`: validation method, direct evidence, counterevidence, and the conclusion used by the report.
-- finding `codeEvidence`: stable, exact source snippets with labels, locations, language, and explanations; `rootCause`, `validation`, and `attackPath` select the snippets they need through `evidenceRefs`.
+- finding `codeEvidence`: stable, exact source snippets with labels, locations, language, and explanations; `rootCause`, `validation`, and `attackPath` select the snippets they need through `evidenceRefs`. Each snippet's `path`, `startLine`, and `endLine` follow the same rules as finding `locations`: a safe repository-relative POSIX path, a positive `startLine`, and an `endLine` no smaller than `startLine`. Every `evidenceRefs` array (or legacy `evidence_refs`), at any nesting depth such as `attackPath.dataflow.evidenceRefs`, must name existing snippet ids.
 - finding `rootCause`: the violated invariant and the code that breaks it. Do not substitute a path/line restatement for the explanation.
 - finding `attackPath.dataflow`: source, transformations, sink, outcome, and a concise source-to-sink narrative.
 - finding `attackPath.reachability`: attacker, entry point, preconditions, outcome, and a concise reachability narrative.
@@ -158,6 +180,8 @@ These fields are optional for compatibility with existing v1 canonical artifacts
 - `<skill_root>/schemas/scan-manifest.schema.json`
 - `<skill_root>/schemas/findings.schema.json`
 - `<skill_root>/schemas/coverage.schema.json`
+
+The bundled validator implements a deliberate subset of JSON Schema: `type`, `const`, `enum`, `minLength`, `pattern` (from a fixed list of reviewed expressions), `format: date-time`, `minimum`, `maximum`, `minItems`, `items`, `contains`, `minContains`, `maxContains`, `required`, `properties`, boolean `additionalProperties`, `allOf`, `if`, and `then`, plus the annotations `$schema`, `$id`, `$comment`, `title`, `description`, `default`, `examples`, `deprecated`, `readOnly`, and `writeOnly`. Subschemas must be objects. A schema that uses any other keyword or form is rejected before validation rather than silently ignored.
 
 V1 consumers ignore unknown properties for forward compatibility. Producers must still validate documented fields and should not emit undocumented properties casually.
 

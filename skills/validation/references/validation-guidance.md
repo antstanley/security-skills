@@ -24,7 +24,7 @@ When the input contains multiple candidate instances, preserve that instance inv
 - do not collapse multiple candidate instances into one validated finding solely because they share a vulnerability family
 - for repeated instances provided by discovery or the security scan workflow, validate a representative exploit path once when feasible, then analytically validate each sibling instance by checking the same proof tuple: attacker-controlled source, missing or incomplete closest control, dangerous sink, and impact
 - for repeated vulnerable templates, query builders, parser operations, auth/object endpoints, or shared-helper callers, preserve each independently vulnerable file and sink/control line as a surviving instance when the proof tuple applies. Grouping is acceptable for readability only after every affected instance has its own surviving finding entry or explicit suppressed/deferred row.
-- if discovery hands validation a broad family candidate with multiple concrete sink, parser, helper, API-mode, or protected-action lines, expand it into child closure rows before deciding survival. One representative PoC may support the family, but each child still needs its own file/line, source or protected boundary, closest control, sink or action, disposition, and counterevidence.
+- if discovery hands validation a broad family candidate with multiple concrete sink, parser, helper, API-mode, or protected-action lines, expand it into child closure rows before deciding survival. One representative PoC may support the family, but each child still needs its own file/line, source or protected boundary, closest control, sink or action, disposition, and counterevidence. In compact standard-scan mode, record the children in the row's `validation.children` array as defined in `references/scan-artifacts.md`; the ledger row and its discovery fields stay unchanged. In other modes, give each child its own row in the validation closure table, identified by the same `<candidate_id>.<child-slug>` child id.
 - when one route or helper exposes multiple same-family operations such as `execute`/`executemany`/`executescript`, `pickle.load`/`pickle.loads`/`yaml.load`/`yaml.load_all`, separate path/file helpers, insert/select/delete/update query builders, or unauthenticated create/delete/reset/admin/job actions, validate or suppress each independently triggerable operation rather than carrying only one representative row.
 - treat shared or generated wrappers as reachability evidence during validation. Do not let a proved wrapper path replace the child sink/control/protected-action rows that determine whether each concrete instance survives.
 - after a repeated high-impact pattern has one strong proof tuple, stop deepening that one proof unless extra runtime work would materially change reportability, severity, or confidence. Spend the next validation effort on sibling ledger rows and suppress only with exact per-instance counterevidence.
@@ -92,7 +92,7 @@ Use this checklist to keep validation close to the prompt contract:
 - Include a realistic-interface criterion when the code exposes an HTTP, CLI, message, file, or other user-reachable interface.
 - Prefer precise, bounded steps over broad scans.
 - For non-compiled stacks, prefer minimal targeted code understanding and only the smallest set of files needed.
-- For compiled stacks, prefer stronger evidence in this order when feasible:
+- For compiled stacks, attempt validation methods in this order when feasible:
   - crash
   - valgrind or ASan
   - debugger trace
@@ -113,9 +113,10 @@ Use this checklist to keep validation close to the prompt contract:
 
 ## Confidence Guidance
 
-Calibrate confidence from the strongest evidence actually obtained, not the scariness of the bug class. Every consumer — the findings schema enum, the compact `validation` record, and this skill's output contract — takes the categorical levels `high`, `medium`, or `low`:
+Use the confidence scale in `references/static-finding-assessment.md` for every confidence value this skill records: the compact `validation` record, each of its `children` entries, and the standalone report. That scale covers both dynamic reproduction (including end-to-end HTTP or other interface reproduction) and complete static traces; do not restate or reinterpret it here.
 
-- `high`: a reproduced crashing PoC, a valgrind or ASan reproduction, or a debugger trace that demonstrates the vulnerability path end to end
-- `medium`: a focused test or realistic interface reproduction that stops short of full demonstration, or a complete static source/control/sink/impact trace with no material counterevidence
-- `low`: code understanding with a defensible conclusion but unresolved reachability, precondition, or exploitability gaps
-- counterevidence that clearly defeats the suspected vulnerability is a `suppressed` disposition with that counterevidence recorded, not a low-confidence finding
+Validation-specific notes:
+
+- The method order in the checklist above is the order in which to attempt proof, not a confidence ladder. Record the method that produced the strongest evidence and calibrate from that evidence.
+- Counterevidence that clearly defeats the suspected vulnerability is a `suppressed` disposition with that counterevidence recorded, not a low-confidence finding.
+- Missing runtime setup is a proof gap to record in `counterevidence_or_proof_gap` or the report, not a reason by itself to lower a complete static trace.

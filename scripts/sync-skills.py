@@ -8,8 +8,11 @@ needs, so every skill folder works on its own. That matters because installers
 directory and nothing else.
 
 Shared files are included when a skill's text (or the text of another included
-shared file) mentions their file name. Links written as `../../references/x.md`
-are rewritten to `references/x.md` so they resolve inside the copied folder.
+shared file) mentions their file name. A Python helper is included when Markdown
+or JSON text names its `.py` file, or when an included helper actually loads it
+(an import, a `_load_script("name")` call, or a literal "name.py" path). Links
+written as `../../references/x.md` are rewritten to `references/x.md` so they
+resolve inside the copied folder.
 
 Never edit skills/ by hand. Edit src/, then run this script.
 
@@ -81,48 +84,56 @@ def text_of(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def mentions(text: str, name: str) -> bool:
+# How one helper loads another: `import x` / `from x import ...`,
+# `_load_script("x")`, or a literal file name such as `with_name("x.py")`.
+SCRIPT_DEPENDENCY = re.compile(
+    r"^[ \t]*(?:from|import)[ \t]+(\w+)"
+    r"|_load_script\(\s*[\"'](\w+)[\"']\s*\)"
+    r"|[\"'](\w+)\.py[\"']",
+    re.MULTILINE,
+)
+
+
+def script_loads(text: str) -> set[str]:
+    """Return the `<module>.py` file names a Python source actually loads."""
+    return {
+        f"{next(group for group in match.groups() if group)}.py"
+        for match in SCRIPT_DEPENDENCY.finditer(text)
+    }
+
+
+def mentions(text: str, name: str, *, python_source: bool) -> bool:
     """Whether text refers to a shared file.
 
-    Scripts are often referenced by module name rather than file name
-    (`from rank_preview import ...`, `_load_script("validate_report_format")`),
-    so a Python file also matches on its stem as a whole word.
+    Prose must name a helper by its full file name (`preflight.py`): a bare stem
+    is too often an ordinary word ("run the preflight"). Inside a Python helper,
+    only real loads count, so a comment that mentions a sibling does not pull it in.
     """
-    if name in text:
-        return True
     if name.endswith(".py"):
-        stem = re.escape(name[: -len(".py")])
-        return re.search(rf"(?<!\w){stem}(?!\w)", text) is not None
-    return False
+        if python_source:
+            return name in script_loads(text)
+        return re.search(rf"(?<![\w-]){re.escape(name)}(?!\w)", text) is not None
+    return name in text
 
 
 def shared_closure(skill: Path, index: dict[str, Path]) -> set[str]:
     """Return the shared file names a skill needs, following mentions transitively."""
-    corpus = [text_of(p) for p in iter_files(skill)]
     needed: set[str] = set()
-    pending = list(corpus)
+    pending = [(text_of(p), p.suffix == ".py") for p in iter_files(skill)]
     while pending:
-        text = pending.pop()
+        text, python_source = pending.pop()
         for name, path in index.items():
-            if name in needed or not mentions(text, name):
+            if name in needed or not mentions(text, name, python_source=python_source):
                 continue
             needed.add(name)
-            pending.append(text_of(path))
+            pending.append((text_of(path), path.suffix == ".py"))
     return needed
 
 
-# Imports and by-name loads that a copied script must be able to satisfy.
-SCRIPT_DEPENDENCY = re.compile(
-    r"^(?:from|import) (\w+)|_load_script\(\"(\w+)\"\)|\"(\w+)\.py\"", re.MULTILINE
-)
-
-
 def check_script_dependencies(skill_dir: Path, index: dict[str, Path]) -> None:
-    """Fail the build if an installed script names a sibling it does not carry."""
+    """Fail the build if an installed script loads a sibling it does not carry."""
     for script in (skill_dir / "scripts").glob("*.py"):
-        for match in SCRIPT_DEPENDENCY.finditer(script.read_text(encoding="utf-8")):
-            module = next(group for group in match.groups() if group)
-            sibling = f"{module}.py"
+        for sibling in sorted(script_loads(script.read_text(encoding="utf-8"))):
             if sibling in index and not (skill_dir / "scripts" / sibling).exists():
                 sys.exit(
                     f"sync-skills: {skill_dir.name}/scripts/{script.name} needs {sibling}, "
@@ -165,13 +176,29 @@ def build(out: Path) -> list[str]:
     return names
 
 
-def same_tree(a: Path, b: Path) -> bool:
-    """Compare two trees file by file, ignoring cache directories."""
-    left = {p.relative_to(a) for p in iter_files(a)}
-    right = {p.relative_to(b) for p in iter_files(b)}
-    if left != right:
-        return False
-    return all(filecmp.cmp(a / rel, b / rel, shallow=False) for rel in left)
+def tree_entries(root: Path) -> set[Path]:
+    """Every file and directory under root, with nothing skipped."""
+    return {path.relative_to(root) for path in root.rglob("*")}
+
+
+def tree_drift(built: Path, out: Path) -> list[str]:
+    """Describe how out differs from a fresh build.
+
+    The output side is compared without the source-side skips, so stale
+    evaluation files, caches, .DS_Store, and leftover or empty skill
+    directories in skills/ all count as drift: an installer would ship them.
+    """
+    expected = tree_entries(built)
+    actual = tree_entries(out)
+    drift = [f"missing: {rel}" for rel in sorted(expected - actual)]
+    drift += [f"unexpected: {rel}" for rel in sorted(actual - expected)]
+    for rel in sorted(expected & actual):
+        left, right = built / rel, out / rel
+        if left.is_dir() != right.is_dir():
+            drift.append(f"type differs: {rel}")
+        elif left.is_file() and not filecmp.cmp(left, right, shallow=False):
+            drift.append(f"content differs: {rel}")
+    return drift
 
 
 def main() -> int:
@@ -183,12 +210,21 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             built = Path(tmp) / "skills"
             names = build(built)
-            if not OUT.is_dir() or not same_tree(built, OUT):
-                print("sync-skills: skills/ is out of date — run scripts/sync-skills.py", file=sys.stderr)
+            drift = tree_drift(built, OUT) if OUT.is_dir() else ["missing: skills/"]
+            if drift:
+                print(
+                    "sync-skills: skills/ is out of date — run scripts/sync-skills.py",
+                    file=sys.stderr,
+                )
+                for line in drift[:50]:
+                    print(f"  {line}", file=sys.stderr)
+                if len(drift) > 50:
+                    print(f"  ... and {len(drift) - 50} more", file=sys.stderr)
                 return 1
         print(f"skills/ is up to date ({len(names)} skills).")
         return 0
 
+    # Rebuild from scratch so stale skills, evals, and caches never survive a sync.
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir(parents=True)

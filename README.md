@@ -74,12 +74,12 @@ Options:
 
 | Option | Effect |
 | --- | --- |
-| `--skills LIST` | Comma-separated skill names, or `all`. Skips the skill prompt. |
-| `--dest DIR` | Install into `DIR`. Skips the destination prompt. |
+| `--skills LIST` | Comma-separated skill names, or `all`. Skips the skill prompt. An empty value is an error. |
+| `--dest DIR` | Install into `DIR`. Skips the destination prompt. An empty value is an error. |
 | `--yes` | No prompts. Installs all skills to `~/.agents/skills`, or to `--dest` if given. Use this in scripts and when there is no terminal. |
 | `--list` | Print every skill with its description, then exit. |
 | `--dry-run` | Print what would be copied. Change nothing. |
-| `--force` | Replace folders the installer did not create. Without it, those folders are skipped. |
+| `--force` | Replace folders the installer did not create. Without it, those folders are skipped. The installer still refuses a destination that is, contains, or sits inside the source `skills/` folder. |
 | `--ref REF` | Git ref to download when not run from a clone. Default `main`. |
 | `-h`, `--help` | Show the built-in help. |
 
@@ -90,7 +90,7 @@ Environment variables:
 | `SECURITY_SKILLS_REPO` | `owner/name` to download from. Default `antstanley/security-skills`. |
 | `SECURITY_SKILLS_ARCHIVE` | Path to a local `.tar.gz` of the repo. Skips the download. Useful offline or for testing. |
 
-Installed folders get a marker file, `.installed-by-security-skills`. Re-running the installer replaces each folder it installed with the current version. Edits you made inside those folders are lost, so keep local changes elsewhere.
+Installed folders get a marker file, `.installed-by-security-skills`. Re-running the installer replaces each folder it installed with the current version. Each skill is copied into a staging folder beside the destination first and swapped in only after the copy succeeds, so a failed copy leaves the previous version in place. Edits you made inside those folders are lost, so keep local changes elsewhere.
 
 Examples:
 
@@ -130,7 +130,7 @@ The 13 skills split into three groups. Scan entry points run the whole workflow.
 | `fix-finding` | Writes a minimal patch for one finding, applies it, and verifies it. | You want a fix for a validated finding. |
 | `vulnerability-writeup` | Writes a detailed, source-backed report per finding, with a proof of concept where possible. | You need a report to hand to engineering or a disclosure. |
 | `propose-security-hardening` | Proposes structural fixes that cover many findings at once, with trade-offs and an implementation plan. | Per-finding patches are not enough and you want a systemic fix. |
-| `track-findings` | Files validated findings as Linear, Jira, or GitHub issues, or drafts GitHub security advisories. Asks before each write. | You want findings in your tracker. |
+| `track-findings` | Files validated findings as Linear, Jira, or GitHub issues, or drafts GitHub security advisories. Shows the exact payload and asks for approval before writing; a batch of up to 25 issues is approved once, as one exact previewed list, then each write is read back. | You want findings in your tracker. |
 | `define-security-policy` | Writes or updates the repo's `SECURITY.md`. Defines what is in scope, out of scope, and which properties must hold. | Scans keep flagging things that are out of scope, or the scope is unclear. |
 
 ## How a scan runs
@@ -146,8 +146,8 @@ Where output goes:
 | --- | --- | --- |
 | `SECURITY_SCAN_ROOT` | Where scan bundles are written. Nothing is written into the repo under review. | `$TMPDIR/security-scans` |
 | `SECURITY_STATE_DIR` | Durable plugin state. | `$XDG_STATE_HOME/security-skills`, or `~/.local/state/security-skills` |
-| `SECURITY_STARTED_AT` | Makes sealing deterministic: repeated finalize runs produce byte-identical bundles. | unset |
-| `PYTHON` | Interpreter for the helper scripts. | the preflight's own interpreter |
+| `SECURITY_STARTED_AT` | Supplies `scan.startedAt` when the draft manifest omits it. It never sets `completedAt` or `sealedAt`; record `completedAt` in the draft for byte-identical repeated finalization of a draft. | unset |
+| `PYTHON` | Interpreter for the helper scripts. | the preflight's own interpreter; in skills without a preflight, `python3` (`python` on Windows) |
 
 A worked example bundle lives in `src/examples/completed-scan/`, with the three canonical JSON files and the generated report.
 
@@ -181,7 +181,7 @@ security-skills/
 └── LICENSE.md                    Apache-2.0, with the list of changes from upstream
 ```
 
-Each skill folder is self-contained because installers copy one folder at a time. The Vercel CLI and `install.sh` both work this way. The generator copies in the shared references, scripts, and schemas each skill mentions, and rewrites `../../references/...` links to point at its own copies.
+Each skill folder is self-contained because installers copy one folder at a time. The Vercel CLI and `install.sh` both work this way. The generator copies in the shared references, scripts, and schemas each skill mentions, and rewrites `../../references/...` links to point at its own copies. Prose must name a helper by its `.py` file name to pull it in; a helper's own sibling imports and loads are followed automatically.
 
 ### Working on the skills
 
@@ -199,7 +199,7 @@ Never edit `skills/` by hand. The next regeneration overwrites your change.
 
 Nothing in these skills depends on one agent harness or one model.
 
-- **Skill root, not plugin root.** Each skill resolves `<skill_root>`, the folder containing its own `SKILL.md`. Every installed skill carries the scripts, references, and schemas it needs, so the paths work wherever the skill is installed.
+- **Skill root, not plugin root.** Each skill resolves `<skill_root>`, the folder containing its own `SKILL.md`. Every installed skill carries the scripts, references, and schemas it needs (not every skill needs all three), so the paths work wherever the skill is installed.
 - **Subagents are optional.** A subagent is a delegated worker with its own context. The skills name the capability, not the tool. Where delegation is unavailable, the parent runs every phase in order with the same coverage, and preflight reports that as the documented fallback. `deep-security-scan` is the exception: it needs delegation and says so.
 - **Companion skills by name.** Skills refer to each other by skill name. Each harness loads them through its own skill mechanism, or the agent reads the `SKILL.md` directly.
 - **Questions and tasks.** Skills use the harness's prompt if it has one, and ask in plain text if not. Task tracking is used when available.

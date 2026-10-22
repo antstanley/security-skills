@@ -21,6 +21,17 @@ DISPOSITION_LABELS = {
     "not_applicable": "Not applicable",
     "needs_follow_up": "Needs follow-up",
 }
+CONFIDENCE_SCALE_LINES = (
+    "### Confidence Scale",
+    "",
+    "| Label | Meaning |",
+    "| --- | --- |",
+    "| high | Direct evidence supports the finding with no material unresolved blocker. |",
+    "| medium | Evidence supports a plausible issue, but material runtime or reachability "
+    "proof remains. |",
+    "| low | Evidence is incomplete; the finding is reported so it can be followed up "
+    "explicitly. |",
+)
 WRITEUP_REPORT_PATH_RE = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 
 
@@ -68,6 +79,21 @@ def _strings(value: Any) -> list[str]:
         if text:
             normalized.append(text)
     return normalized
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize a field documented as a list but sometimes written as one string."""
+
+    if isinstance(value, str):
+        text = _text(value, "")
+        return [text] if text else []
+    return _strings(value)
+
+
+def _rationale(value: Any) -> str:
+    """Return the `why` text of an `attackPath.impact` or `attackPath.likelihood` object."""
+
+    return _text(value.get("why"), "") if isinstance(value, dict) else ""
 
 
 def _cell(value: Any) -> str:
@@ -444,8 +470,18 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
         validation.get("summary"),
         f"{finding['confidence']['rationale']} Validation details were not recorded separately.",
     )
-    validation_evidence = _strings(validation.get("evidence"))
-    validation_counterevidence = _strings(validation.get("counterEvidence"))
+    validation_assertions = _string_list(validation.get("assertions"))
+    # `evidence` and `counterEvidence` predate the documented fields and remain
+    # supported for older producers.
+    validation_evidence = _string_list(validation.get("evidence"))
+    remaining_uncertainty = [
+        *_string_list(validation.get("limitations")),
+        *_string_list(validation.get("counterEvidence")),
+    ]
+    attack_path_summary = _text(attack_path.get("summary"), "")
+    attack_path_limitations = _string_list(attack_path.get("limitations"))
+    impact_rationale = _rationale(attack_path.get("impact"))
+    likelihood_rationale = _rationale(attack_path.get("likelihood"))
     root_cause_summary = _text(
         raw_root_cause if isinstance(raw_root_cause, str) else root_cause.get("summary"),
         "",
@@ -457,9 +493,11 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
         dataflow.get("summary"),
         f"The canonical finding records the affected path at {_locations(finding)}, but no expanded source-to-sink narrative was recorded.",
     )
+    reachability_fallback = (
+        "Reachability was not recorded beyond the canonical finding summary and affected locations."
+    )
     reachability_summary = _text(
-        reachability.get("summary"),
-        "Reachability was not recorded beyond the canonical finding summary and affected locations.",
+        reachability.get("summary"), "" if attack_path_summary else reachability_fallback
     )
     severity_rationale = _text(
         severity.get("rationale"),
@@ -500,16 +538,17 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     if validation.get("method"):
         lines.extend(["", f"Validation method: {_text(validation['method'], 'not recorded')}"])
     lines.extend(_code_evidence_lines(validation_code_evidence))
+    if validation_assertions:
+        lines.extend(["", "Checks:", *_bullets(validation_assertions, "None recorded.")])
     if validation_evidence:
         lines.extend(["", "Evidence:", *_bullets(validation_evidence, "No evidence recorded.")])
-    if validation_counterevidence:
-        lines.extend(
-            [
-                "",
-                "Counterevidence and remaining uncertainty:",
-                *_bullets(validation_counterevidence, "None recorded."),
-            ]
-        )
+    lines.extend(
+        [
+            "",
+            "Counterevidence and remaining uncertainty:",
+            *_bullets(remaining_uncertainty, "None recorded beyond the confidence rationale."),
+        ]
+    )
     lines.extend(["", "#### Dataflow", "", dataflow_summary])
     for label, key in (("Source", "source"), ("Sink", "sink"), ("Outcome", "outcome")):
         if dataflow.get(key):
@@ -518,7 +557,10 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     if transformations:
         lines.extend(["", "Transformations:", *_bullets(transformations, "None recorded.")])
     lines.extend(_code_evidence_lines(attack_path_code_evidence))
-    lines.extend(["", "#### Reachability", "", reachability_summary])
+    lines.extend(["", "#### Reachability"])
+    for paragraph in (attack_path_summary, reachability_summary):
+        if paragraph:
+            lines.extend(["", paragraph])
     for label, key in (
         ("Attacker", "attacker"),
         ("Entry point", "entrypoint"),
@@ -529,12 +571,21 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     preconditions = _strings(reachability.get("preconditions"))
     if preconditions:
         lines.extend(["", "Preconditions:", *_bullets(preconditions, "None recorded.")])
+    if attack_path_limitations:
+        lines.extend(["", "Limitations:", *_bullets(attack_path_limitations, "None recorded.")])
     lines.extend(
         [
             "",
             "#### Severity",
             "",
             f"**{severity['level'].capitalize()}** — {severity_rationale}",
+        ]
+    )
+    for label, rationale in (("Impact", impact_rationale), ("Likelihood", likelihood_rationale)):
+        if rationale:
+            lines.extend(["", f"- **{label}:** {rationale}"])
+    lines.extend(
+        [
             "",
             severity_change,
             "",
@@ -580,23 +631,31 @@ def build_report_markdown(
     target = scan["target"]
     scope = scan["scope"]
     threat_model = scan.get("threatModel") if isinstance(scan.get("threatModel"), dict) else {}
-    findings = sorted(
-        (
-            finding
-            for finding in findings_document["findings"]
-            if finding["severity"]["level"] in REPORTABLE_SEVERITIES
-        ),
-        key=_finding_sort_key,
-    )
+    ordered_findings = sorted(findings_document["findings"], key=_finding_sort_key)
+    findings = [
+        finding
+        for finding in ordered_findings
+        if finding["severity"]["level"] in REPORTABLE_SEVERITIES
+    ]
+    # Informational findings are rendered in their own section after the
+    # reportable ones so they stay visible without inflating reportable counts.
+    informational = [
+        finding
+        for finding in ordered_findings
+        if finding["severity"]["level"] not in REPORTABLE_SEVERITIES
+    ]
     writeup_paths = [_writeup_report_path(finding) for finding in findings]
+    informational_writeup_paths = [_writeup_report_path(finding) for finding in informational]
     duplicate_writeup_paths = sorted(
         path
-        for path, count in Counter(path for path in writeup_paths if path is not None).items()
+        for path, count in Counter(
+            path for path in (*writeup_paths, *informational_writeup_paths) if path is not None
+        ).items()
         if count > 1
     )
     if duplicate_writeup_paths:
         raise ReportProjectionError(
-            "reportable findings have duplicate writeup reportPath values: "
+            "findings have duplicate writeup reportPath values: "
             + ", ".join(duplicate_writeup_paths)
         )
     deep_presentation = _uses_deep_presentation(coverage, findings)
@@ -651,6 +710,8 @@ def build_report_markdown(
             f"| Confidence mix | {_confidence_mix(findings)} |",
         ]
     )
+    if informational:
+        summary_count_lines.append(f"| Informational findings | {len(informational)} |")
     lines.extend(
         [
             "",
@@ -719,18 +780,7 @@ def build_report_markdown(
                     f"| {finding_link} | {finding['severity']['level']} "
                     f"| {finding['confidence']['level']} | {writeup_link} |"
                 )
-        lines.extend(
-            [
-                "",
-                "### Confidence Scale",
-                "",
-                "| Label | Meaning |",
-                "| --- | --- |",
-                "| high | Direct evidence supports the finding with no material unresolved blocker. |",
-                "| medium | Evidence supports a plausible issue, but material runtime or reachability proof remains. |",
-                "| low | Evidence is incomplete and the item is retained only for explicit follow-up. |",
-            ]
-        )
+        lines.extend(["", *CONFIDENCE_SCALE_LINES])
         for number, (finding, report_path) in enumerate(
             zip(findings, writeup_paths, strict=True), 1
         ):
@@ -739,13 +789,45 @@ def build_report_markdown(
             else:
                 lines.extend(["", *_finding_section(number, finding)])
     else:
+        no_findings = (
+            "No reportable findings survived the canonical discovery, validation, and "
+            "reportability gates."
+        )
+        if informational:
+            no_findings += " Informational findings are listed below."
+        lines.extend(["### No findings", "", no_findings])
+    if informational:
         lines.extend(
             [
-                "### No findings",
                 "",
-                "No reportable findings survived the canonical discovery, validation, and reportability gates.",
+                "### Informational Findings",
+                "",
+                "These findings have `informational` severity. They are listed for completeness "
+                "and are not counted as reportable findings.",
+                "",
+                "| Finding | Confidence | Detailed write-up |",
+                "| --- | --- | --- |",
             ]
         )
+        first_number = len(findings) + 1
+        for number, (finding, report_path) in enumerate(
+            zip(informational, informational_writeup_paths, strict=True), first_number
+        ):
+            title = _link_label(finding["title"], "Untitled finding")
+            writeup_link = f"[Open report]({report_path})" if report_path else "inline below"
+            lines.append(
+                f"| [{title}](#finding-{number}) | {finding['confidence']['level']} "
+                f"| {writeup_link} |"
+            )
+        if not findings:
+            lines.extend(["", *CONFIDENCE_SCALE_LINES])
+        for number, (finding, report_path) in enumerate(
+            zip(informational, informational_writeup_paths, strict=True), first_number
+        ):
+            if report_path is not None:
+                lines.extend(["", *_linked_finding_section(number, finding, report_path)])
+            else:
+                lines.extend(["", *_finding_section(number, finding)])
     if hardening_portfolio_path is not None:
         lines.extend(
             [

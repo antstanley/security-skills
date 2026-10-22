@@ -7,7 +7,8 @@ This script stays deliberately model-free:
   JSONL candidate worklist that ranking subagents consume.
 - `make-diff-rank-input` creates the deterministic diff-scoped JSONL candidate
   worklist from Git changed paths. It supports committed revision diffs and
-  local working-tree patches.
+  local working-tree patches, keeps every changed non-binary file, and skips
+  only binary files, dependency lockfiles, and minified bundles or source maps.
 - `make-rank-shards` partitions the ranking input into deterministic shards.
 - `make-rank-pool-plan` assigns those shards to a deterministic bounded worker
   pool.
@@ -38,6 +39,7 @@ from pathlib import Path
 # Some hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rank_preview import DEFAULT_PREVIEW_BYTES, TEXT_CODE_EXTENSIONS, preview_for
+from target_identity import resolve_commit, worktree_changes
 
 EXCLUDED_DIRS = {
     ".cache",
@@ -115,6 +117,30 @@ EXCLUDED_FILENAMES = {
     "yarn.lock",
 }
 
+# Diff scans keep every changed non-binary file. These are the only text files
+# they skip: machine-generated dependency lockfiles and minified bundles or
+# source maps, whose full-file review would dwarf the change itself.
+DIFF_SKIPPED_FILENAMES = {
+    "Cargo.lock",
+    "Gemfile.lock",
+    "Pipfile.lock",
+    "bun.lock",
+    "composer.lock",
+    "go.sum",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "yarn.lock",
+}
+DIFF_SKIPPED_SUFFIXES = (".min.js", ".min.css", ".map")
+
+# Repository configuration can attach external diff drivers, textconv filters,
+# and fsmonitor hooks that execute arbitrary commands. A scanner must never run
+# code chosen by the repository under review, so every Git call disables them.
+GIT_HARDENING_OPTIONS = ("-c", "core.fsmonitor=false", "--no-optional-locks")
+GIT_DIFF_HARDENING_OPTIONS = ("--no-ext-diff", "--no-textconv", "--no-relative")
+
 # Ambient Git environment variables would silently redirect every diff probe
 # below to another repository, so strip them the way target_identity.py does.
 GIT_REPOSITORY_ENVIRONMENT = (
@@ -170,15 +196,22 @@ def parse_args() -> argparse.Namespace:
 
     diff = subparsers.add_parser(
         "make-diff-rank-input",
-        help="Create rank_input.jsonl from Git changed source-like files.",
+        help="Create rank_input.jsonl from every changed non-binary file in a Git diff.",
     )
-    diff.add_argument("--repo", required=True, help="Repository root.")
+    diff.add_argument(
+        "--repo",
+        required=True,
+        help="Repository root or any directory inside it; paths are repository-root-relative.",
+    )
     diff.add_argument("--base", required=True, help="Git diff base revision.")
     diff.add_argument(
         "--mode",
         choices=("revisions", "local-patch"),
         default="revisions",
-        help="Git diff mode: committed revisions or staged plus unstaged local patch.",
+        help=(
+            "Git diff mode: committed revisions, or a local patch of staged, unstaged, "
+            "and untracked (not ignored) files."
+        ),
     )
     diff.add_argument("--head", default="HEAD", help="Git diff head revision.")
     diff.add_argument("--out", required=True, help="Output rank_input.jsonl path.")
@@ -268,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         "--top-percent",
         type=int,
         default=100,
-        help="Percent of included files to keep for deep review.",
+        help="Percent of included files to keep for deep review, from 1 through 100.",
     )
     return parser.parse_args()
 
@@ -473,17 +506,8 @@ def git_environment() -> dict[str, str]:
     return environment
 
 
-def run_git_changed_paths(repo: Path, diff_args: list[str]) -> list[tuple[Path, str]]:
-    command = [
-        "git",
-        "-C",
-        str(repo),
-        "diff",
-        "--name-status",
-        "-z",
-        "--diff-filter=ACMRD",
-        *diff_args,
-    ]
+def run_git(repo: Path, git_args: list[str], label: str) -> bytes:
+    command = ["git", *GIT_HARDENING_OPTIONS, "-C", str(repo), *git_args]
     try:
         # Read bytes and decode UTF-8 explicitly: the Windows ANSI codepage
         # breaks non-ASCII paths, and text-mode newline translation must never
@@ -501,65 +525,122 @@ def run_git_changed_paths(repo: Path, diff_args: list[str]) -> list[tuple[Path, 
         stderr_lines = result.stderr.decode("utf-8", errors="replace").splitlines()
         stderr = next((line.strip() for line in stderr_lines if line.strip()), "")
         detail = f": {stderr}" if stderr else ""
-        print(
-            f"generate_rank_input.py: error: git diff failed for {' '.join(diff_args)}{detail}",
-            file=sys.stderr,
-        )
+        print(f"generate_rank_input.py: error: {label} failed{detail}", file=sys.stderr)
         raise SystemExit(2)
-    fields = result.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+    return result.stdout
+
+
+def git_toplevel(repo: Path) -> Path:
+    output = run_git(repo, ["rev-parse", "--show-toplevel"], "git rev-parse --show-toplevel")
+    toplevel = output.decode("utf-8", errors="surrogateescape").strip()
+    if not toplevel:
+        raise SystemExit(f"Not inside a Git work tree: {repo}")
+    return Path(toplevel).resolve()
+
+
+def split_nul_fields(output: bytes) -> list[str]:
+    fields = output.decode("utf-8", errors="surrogateescape").split("\0")
     if fields and not fields[-1]:
         fields.pop()
+    return fields
 
-    changed: list[tuple[Path, str]] = []
+
+def run_git_changed_paths(toplevel: Path, diff_args: list[str]) -> dict[str, str]:
+    # --no-relative pins paths to the repository root even when diff.relative
+    # is configured, so they always match the toplevel the caller resolved.
+    output = run_git(
+        toplevel,
+        [
+            "diff",
+            *GIT_DIFF_HARDENING_OPTIONS,
+            "--name-status",
+            "-z",
+            "--diff-filter=ACDMRTU",
+            *diff_args,
+            "--",
+        ],
+        f"git diff {' '.join(diff_args)}",
+    )
+    fields = split_nul_fields(output)
+    changed: dict[str, str] = {}
     index = 0
     while index < len(fields):
         status = fields[index][0]
         index += 1
         if status in {"C", "R"}:
             index += 1
-        path = repo / fields[index]
+        changed[fields[index]] = status
         index += 1
-        changed.append((path, status))
     return changed
 
 
-def git_changed_paths(repo: Path, base: str, head: str, mode: str) -> list[tuple[Path, str]]:
+def git_changed_paths(toplevel: Path, base: str, head: str, mode: str) -> list[tuple[str, str]]:
     if mode == "revisions":
-        return run_git_changed_paths(repo, [f"{base}..{head}"])
+        return sorted(run_git_changed_paths(toplevel, [f"{base}..{head}"]).items())
     if mode == "local-patch":
-        unstaged = run_git_changed_paths(repo, [base])
-        staged = run_git_changed_paths(repo, ["--cached", base])
-        combined = dict(staged)
-        combined.update(unstaged)
-        return sorted(combined.items())
+        return local_patch_changed_paths(toplevel, base)
     raise SystemExit(f"Unknown diff mode: {mode}")
+
+
+def local_patch_changed_paths(toplevel: Path, base: str) -> list[tuple[str, str]]:
+    # `git diff` against the working tree runs repository-configured clean filters,
+    # so working-tree changes are found by hashing files directly instead.
+    base_commit = resolve_commit(toplevel, base, "--base")
+    changed: dict[str, str] = {}
+    for record in worktree_changes(toplevel, ".", base_commit):
+        fields = dict(record)
+        if b"untracked-path" in fields:
+            changed[os.fsdecode(fields[b"untracked-path"])] = "A"
+            continue
+        if fields[b"kind"] == b"missing":
+            status = "D"
+        elif fields[b"base"] == b"absent":
+            status = "A"
+        else:
+            status = "M"
+        changed[os.fsdecode(fields[b"path"])] = status
+    return sorted(changed.items())
+
+
+def diff_path_is_skipped(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return name in DIFF_SKIPPED_FILENAMES or name.endswith(DIFF_SKIPPED_SUFFIXES)
 
 
 def make_diff_rank_input(args: argparse.Namespace) -> None:
     repo = Path(args.repo).expanduser().resolve()
     if not repo.is_dir():
         raise SystemExit(f"Repo path not found: {repo}")
+    for label, revision in (("--base", args.base), ("--head", args.head)):
+        # A leading dash would be parsed by git as an option, not a revision.
+        if not revision or revision.startswith("-"):
+            raise SystemExit(f"{label} must be a revision that does not start with '-'")
+    toplevel = git_toplevel(repo)
 
     rows: list[JsonRow] = []
-    for path, status in git_changed_paths(repo, args.base, args.head, args.mode):
-        rel = path.relative_to(repo)
-        if path_is_excluded(rel) or path.suffix.lower() not in TEXT_CODE_EXTENSIONS:
+    skipped: list[str] = []
+    for rel, status in git_changed_paths(toplevel, args.base, args.head, args.mode):
+        if diff_path_is_skipped(rel):
+            skipped.append(f"{rel} (lockfile or minified bundle)")
             continue
-
-        if status == "D":
-            preview = ""
-        elif path.is_file():
+        path = toplevel / rel
+        # Deleted files, symlinks, and submodule entries stay in the worklist
+        # with an empty preview; never follow a changed symlink out of the tree.
+        if status != "D" and not path.is_symlink() and path.is_file():
             preview, is_binary = preview_for(path, args.preview_bytes)
             if is_binary:
+                skipped.append(f"{rel} (binary)")
                 continue
         else:
             preview = ""
-        rows.append({"path": rel.as_posix(), "area": args.area, "preview": preview})
+        rows.append({"path": rel, "area": args.area, "preview": preview})
 
     rows.sort(key=lambda row: str(row["path"]))
     output = Path(args.out).expanduser()
     write_jsonl(output, rows)
     print(f"Wrote {len(rows)} rows to {output}")
+    if skipped:
+        print(f"Skipped {len(skipped)} changed paths: {'; '.join(skipped)}")
 
 
 def make_rank_shards(args: argparse.Namespace) -> None:
@@ -969,6 +1050,8 @@ def copy_deep_review_input(args: argparse.Namespace) -> None:
 
 
 def select_deep_review_input(args: argparse.Namespace) -> None:
+    if not 0 < args.top_percent <= 100:
+        raise SystemExit("--top-percent must be greater than 0 and at most 100")
     rank_output = Path(args.rank_output).expanduser()
     rows = load_jsonl(rank_output, "Rank output", validate_rank_output_row)
     require_unique_paths(rows, "Rank output")

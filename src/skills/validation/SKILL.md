@@ -26,7 +26,7 @@ Use the shared scan artifact path conventions in `../../references/scan-artifact
 
 ### Compact Standard-Scan Mode
 
-When `security-scan`, or the centralized tail of `deep-security-scan`, explicitly invokes this skill in compact standard-scan mode, use `<discovery_dir>/candidate_ledger.jsonl` as both the candidate input and the phase-closure artifact. Apply the validation method and evidence rules in this skill to the full candidate set in one invocation. Add one nested `validation` record to every row, using the compact record shape in `../../references/scan-artifacts.md`, while preserving every discovery field and row order.
+When `security-scan`, or the centralized tail of `deep-security-scan`, explicitly invokes this skill in compact standard-scan mode, use `<discovery_dir>/candidate_ledger.jsonl` as both the candidate input and the phase-closure artifact. Apply the validation method and evidence rules in this skill to the full candidate set in one invocation. Add one nested `validation` record to every row, using the compact record shape in `../../references/scan-artifacts.md`, while preserving every discovery field and row order. When a row is a broad family that must be expanded into child closure rows, record each child in that record's `children` array, with its own `child_id`, locations, disposition, and rationale, and set the parent disposition as that reference describes. Never split, add, or edit ledger rows to represent children.
 
 In this mode, the nested record replaces the per-finding validation report, receipt, and closure table. Rewrite the ledger atomically. Do not feed the enriched ledger back through the discovery normalizer. Create `<discovery_dir>/validation_artifacts/<candidate_id>/` only when validation produces an actual PoC, crafted input, or log, and reference it from the nested record. All validation reasoning, instance-preservation, evidence, and confidence requirements still apply; only the artifact packaging changes.
 
@@ -49,7 +49,7 @@ In this mode, the nested record replaces the per-finding validation report, rece
 6. Save any PoC files, inputs, or logs under the validation artifacts path for the active mode from `../../references/scan-artifacts.md`.
 7. If validation is not feasible, document what was tried, what remains uncertain, and the exact proof gap.
 8. Return a clear validation assessment per finding grounded in the evidence, proof gaps, and remaining uncertainty.
-9. In compact standard-scan mode, add the nested `validation` record to every candidate row and atomically replace the ledger.
+9. In compact standard-scan mode, add the nested `validation` record, including any `children` entries, to every candidate row and atomically replace the ledger.
 10. Outside compact standard-scan mode, save that finding's visible validation report and append one validation receipt per candidate id at the default paths from `../../references/scan-artifacts.md`. The receipt must record the validation method, evidence or exact proof gap, disposition, and validation artifact/report reference for that candidate finding.
 
 ## Usage Guidance
@@ -61,12 +61,12 @@ In this mode, the nested record replaces the per-finding validation report, rece
 
 ## Validation Guidance
 
-Follow the instance-preserving validation rules, validation checklist, and confidence guidance in `references/validation-guidance.md`.
+Follow the instance-preserving validation rules, validation checklist, and confidence notes in `references/validation-guidance.md`. Confidence levels come from the shared confidence scale in `../../references/static-finding-assessment.md`, whether the evidence is dynamic or static.
 When validation falls back to static code understanding, or when static evidence is proportionate for large internal repositories, use the shared source/control/sink, boundary, counterevidence, and proof-gap guidance in `../../references/static-finding-assessment.md`.
 
 ## Output Contract
 
-In compact standard-scan mode, use the nested record defined in `../../references/scan-artifacts.md`. Every input row must receive exactly one validation disposition. The record is the closure table for this mode; do not also create a narrative report or receipt.
+In compact standard-scan mode, use the nested record defined in `../../references/scan-artifacts.md`. Every input row must receive exactly one validation record with a disposition, and every entry in its `children` array, when present, must have its own disposition. The record is the closure table for this mode; do not also create a narrative report or receipt.
 
 Outside compact standard-scan mode, use the following report contract.
 
@@ -107,7 +107,7 @@ For repository-wide and scoped-path scans, also include a validation closure tab
 - If a finding depends on missing product assumptions, state the question clearly instead of fabricating the answer.
 - Keep commands short, bounded, and non-interactive.
 - Use stronger validation methods such as crashing PoCs, valgrind, ASan, debugger traces, focused tests, or realistic interface reproduction before falling back to code understanding when the stack and scan scope make that feasible.
-- Calibrate confidence from the validation method and evidence, not from how dangerous the bug class sounds.
+- Calibrate confidence with the shared confidence scale in `../../references/static-finding-assessment.md`, from the strongest evidence obtained, not from how dangerous the bug class sounds.
 - Keep validation artifacts and phase output in the paths for the active mode from `../../references/scan-artifacts.md` so the full scan bundle lives together. Compact standard scans do not create per-finding validation reports.
 - Make a serious, bounded effort to get runtime validation working when it would materially change reportability, confidence, or severity. Consult repository guidance such as `AGENTS.md` or `CLAUDE.md`, `README.md`, setup docs, test docs, build files, and package-manager metadata to identify the required dependencies, generated files, services, and setup steps.
 - For scans that should not modify the target tree, use a disposable copy or generated-artifact directory under the validation artifacts path for the active mode for builds, generated clients, patched test harnesses, and PoC files. A no-edit target rule does not forbid output-only build copies when they are needed to validate the original code.

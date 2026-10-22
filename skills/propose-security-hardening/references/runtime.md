@@ -7,9 +7,10 @@ mechanism is useful, this guidance names the capability first and gives examples
 
 ## Skill root
 
-`<skill_root>` is the directory that contains the `SKILL.md` you loaded. Every installed
-skill carries the `scripts/`, `references/`, and `schemas/` it needs inside its own folder,
-so `<skill_root>` always contains those three directories.
+`<skill_root>` is the directory that contains the `SKILL.md` you loaded. Each installed
+skill carries the resources it uses inside its own folder, so depending on the skill,
+`<skill_root>` may contain `scripts/`, `references/`, and `schemas/`. Not every skill has
+all three. Use only what this skill bundles.
 
 Resolve `<skill_root>` from the location of the loaded skill, not from the repository under
 review and not from the shell's current directory. Substitute the absolute path into command
@@ -17,9 +18,13 @@ examples and quote it when invoking a helper.
 
 ## Helper scripts
 
-Use the Python interpreter that preflight reports. Do not install dependencies or change
-the target repository merely because the skills are installed. If a dependency is missing,
-surface it concretely and follow the workflow's existing remediation rules.
+When a workflow runs the preflight helper, use the Python interpreter that it reports.
+In a skill without that step, resolve `<python_command>` to `$PYTHON` when one is
+provided, or else to `python` on Windows and `python3` on Unix-like hosts.
+
+Do not install dependencies or change the target repository merely because the skills are
+installed. If a dependency is missing, surface it concretely and follow the workflow's
+existing remediation rules.
 
 ## Companion skills
 

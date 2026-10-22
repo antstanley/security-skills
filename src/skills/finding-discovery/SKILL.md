@@ -33,6 +33,7 @@ If the scan target is for a targeted code-diff:
 
 - Read `../security-scan/references/scan-artifacts-and-ledger.md`.
 - Generate `rank_input.jsonl` deterministically from changed source-like files with `<python_command> <skill_root>/scripts/generate_rank_input.py make-diff-rank-input --repo <repo_root> --base <base> --mode revisions --head <head> --out <discovery_dir>/rank_input.jsonl` for PR, commit, and branch diffs, or `<python_command> <skill_root>/scripts/generate_rank_input.py make-diff-rank-input --repo <repo_root> --base <base> --mode local-patch --out <discovery_dir>/rank_input.jsonl` for a local patch.
+  `--repo` may be the repository root or any directory inside it; rows always use repository-root-relative paths. A local patch covers staged, unstaged, and untracked files that Git does not ignore. The helper keeps every changed text file, including CI workflows, tests, build files, Dockerfiles, infrastructure code, templates, extensionless scripts, deleted files (with an empty preview), and changed symlinks (with an empty preview, never followed). It skips only binary files, dependency lockfiles (such as `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `go.sum`, and `Gemfile.lock`), and minified bundles or source maps (`*.min.js`, `*.min.css`, `*.map`), and prints every skipped path. Review a skipped lockfile directly when the change set's security behavior depends on it, such as a changed dependency source.
 - Copy every diff row into `deep_review_input.jsonl` with `<python_command> <skill_root>/scripts/generate_rank_input.py copy-deep-review-input --rank-input <discovery_dir>/rank_input.jsonl --out <discovery_dir>/deep_review_input.jsonl`. Diff scans do not rank or drop changed files before deep review.
 - Add directly supporting files required to understand the changed security behavior only when repository evidence shows they are needed. Do not use them to broaden into unrelated repository-wide enumeration.
 - Deep-review every file in `deep_review_input.jsonl` using the shared scoped file-review rules.
@@ -100,13 +101,15 @@ Avoid:
 
 If there are no plausible candidates, return a no-findings result.
 
-Otherwise, for each candidate include:
+For repository-wide and scoped-path scans, and for deep-pass discovery, write each candidate as one raw candidate row using only the fields in `../security-scan/references/repository-wide-scan.md`: `cwe_ids`, `locations`, `summary`, `evidence`, and optional `context` and `instance`. The normalizer rejects a row with any other field, such as `title`, and assigns `candidate_id` itself. Put the one-line title at the start of `summary`; put the attacker-controlled source, sink or broken control, impact, closest control, and why the issue is plausible in `evidence`; and put any seed, ledger row, or advisory reference in `context`. Set `instance` only to tell apart separate bugs that share the same locations, such as different request parameters or operations on one line. Do not use it as a general `<family>:<file>:<line>` key: the file and line already live in `locations`, and two rows with different `instance` labels are never merged.
+
+For diff-scoped discovery, for each candidate include:
 
 - candidate id
 - title
 - affected locations, with labels when more than one applies: `entrypoint/wrapper`, `root_control`, `sink`, and `concrete_implementation`
-- instance key in the form `<family>:<file>:<line>` for repository-wide and scoped-path scans
-- seed or ledger row id for repository-wide and scoped-path seeded/root-control rows when available
+- instance label when separate bugs share the same locations
+- seed or ledger row id for seeded/root-control rows when available
 - advisory/source reference for advisory-seeded rows when available
 - attacker-controlled source
 - vulnerable sink or broken control
